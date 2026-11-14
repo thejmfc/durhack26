@@ -1,0 +1,3 @@
+ssd   n=80 usable=70%  within100m=19%  within500m=29%  within1km=31%  top5hit=20%  median(usable)=2597 m  p90(usable)=9496 m
+zssd  n=80 usable=70%  within100m=16%  within500m=21%  within1km=24%  top5hit=18%  median(usable)=3183 m  p90(usable)=12301 m
+ncc   n=80 usable=70%  within100m=10%  within500m=11%  within1km=14%  top5hit=10%  median(usable)=7660 m  p90(usable)=12457 m

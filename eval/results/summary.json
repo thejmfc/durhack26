@@ -1,0 +1,4 @@
+{"run": "main (first 80 of 400 spots, quick check via eval/quick.py)", "n_spots": 80, "method": "ssd", "spacing_m": 50,
+ "headline": {"hfov": 66, "n": 80, "within_100m": 19, "within_1km": 31, "median_m": 2597, "usable_pct": 70},
+ "confidence_table": [],
+ "note": "Quick check only: single 66 deg synthetic photos, sun 2-8 deg. Median is over the 70% of photos with a usable skyline. No real photos tested."}

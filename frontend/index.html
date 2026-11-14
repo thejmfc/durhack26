@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Skyline - locating photos on the Moon from the horizon</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <canvas id="view"></canvas>
+  <aside id="panel">
+    <h1>Skyline</h1>
+    <p class="sub">Where on the Moon was this photo taken? Estimated from the shape of the horizon.</p>
+    <label class="sel">Site <select id="site-pick"></select></label>
+    <div class="row"><button id="fly-site">Fly to site</button><button id="fly-globe" class="ghost">Whole Moon</button></div>
+    <nav id="tabs">
+      <button data-tab="locate" class="on">Locate a photo</button>
+      <button data-tab="test">Test from a spot</button>
+      <button data-tab="batch">Batch</button>
+    </nav>
+
+    <section data-body="locate">
+      <p class="hint">Upload one or more photos taken from the same spot. The search covers only the selected 16 km block: <b id="site-name"></b>.</p>
+      <input id="files" type="file" accept="image/*" multiple />
+      <label>Horizontal field of view <output id="u-fov-o"></output><input id="u-fov" type="range" min="20" max="140" value="66" /></label>
+      <label>Camera pitch (up +) <output id="u-pitch-o"></output><input id="u-pitch" type="range" min="-30" max="30" value="0" /></label>
+      <label>Sky threshold <output id="u-thr-o"></output><input id="u-thr" type="range" min="2" max="40" value="10" /></label>
+      <label class="check"><input id="u-pano" type="checkbox" /> Photos form a panorama, turning right by <input id="u-step" type="number" value="60" min="5" max="180" style="width:56px" />° each</label>
+      <label class="check"><input id="u-hint" type="checkbox" /> I know the heading: <input id="u-hint-h" type="number" value="0" min="0" max="359" style="width:56px" />° ± <input id="u-hint-w" type="number" value="10" min="1" max="90" style="width:48px" />°</label>
+      <button id="u-go" class="primary">Locate</button>
+    </section>
+
+    <section data-body="test" hidden>
+      <p class="hint">Stand anywhere on the site, look around, take a synthetic photo. It goes through the same pipeline as an upload.</p>
+      <div id="t-spot" class="kv note warn">Click the grey site terrain to drop in at ground level, like Street View. Then look around and take the photo.</div>
+      <label>Heading (0 = north) <output id="t-head-o"></output><input id="t-head" type="range" min="0" max="359" value="40" /></label>
+      <label>Pitch <output id="t-pitch-o"></output><input id="t-pitch" type="range" min="-20" max="20" value="0" /></label>
+      <label>Field of view <output id="t-fov-o"></output><input id="t-fov" type="range" min="30" max="120" value="66" /></label>
+      <label class="check"><input id="t-pano" type="checkbox" /> 360° panorama (6 shots, 60° apart)</label>
+      <label class="check"><input id="t-clutter" type="checkbox" checked /> Boulders, small craters and sensor noise</label>
+      <label class="check"><input id="t-hint" type="checkbox" /> Tell the matcher the heading to ±5° (as a sun compass would)</label>
+      <button id="t-go" class="primary" disabled>Render photo &amp; locate</button>
+    </section>
+
+    <section data-body="batch" hidden>
+      <p class="hint">Renders photos at random spots and stores them with the ground truth in <code>eval/runs/</code>. Score them with <code>eval/run_eval.py</code>; results go to EVALUATION.md.</p>
+      <label>Number of spots <input id="b-n" type="number" value="20" min="1" max="2000" /></label>
+      <label>Run name <input id="b-run" type="text" value="ui" /></label>
+      <label class="check"><input id="b-live" type="checkbox" checked /> Score each spot live (single 66° photo) and show it on the map</label>
+      <button id="b-go" class="primary">Start batch</button>
+      <button id="b-replay" class="primary">Replay the 400 stored test photos (Site01)</button>
+      <button id="b-stop" class="ghost" hidden>Stop</button>
+      <div id="b-status" class="kv"></div>
+    </section>
+
+    <section id="sunbox">
+      <h2>Matching</h2>
+      <label class="sel">Scoring rule <select id="m-method">
+        <option value="ssd">absolute height (default)</option>
+        <option value="zssd">shape only, pitch-free</option>
+        <option value="ncc">cross-correlation (brief's baseline)</option>
+      </select></label>
+      <h2 style="margin-top:12px">Sun</h2>
+      <label>Azimuth <output id="s-az-o"></output><input id="s-az" type="range" min="0" max="359" value="60" /></label>
+      <label>Elevation <output id="s-el-o"></output><input id="s-el" type="range" min="1" max="45" step="0.5" value="5" /></label>
+    </section>
+  </aside>
+
+  <div id="status"></div>
+  <div id="frame" hidden></div>
+  <div id="street-hud" hidden>
+    <span id="sv-info"></span>
+    <span class="dim">drag to look · scroll to zoom · click the ground to walk there</span>
+    <button id="sv-go" class="primary" style="width:auto;margin:0">Take photo &amp; locate</button>
+    <button id="sv-exit">Back to map</button>
+  </div>
+  <section id="results" hidden>
+    <header><h2>Result</h2><button id="r-close" class="ghost">Clear</button></header>
+    <div id="r-body"></div>
+  </section>
+
+  <section id="feed" hidden>
+    <header><h2>Live test runs</h2><button id="f-close" class="ghost">Hide</button></header>
+    <div id="f-stats" class="kv"></div>
+    <div class="legend"><i style="background:#3ddc97"></i>true spot <i style="background:#ffd166"></i>estimate</div>
+    <div id="f-list"></div>
+  </section>
+
+  <section id="verify" hidden>
+    <header>
+      <h2 id="v-title">Verification</h2>
+      <span class="legend"><i class="c1"></i>skyline found in the photo <i class="c2"></i>horizon predicted at the candidate</span>
+      <select id="v-img"></select>
+      <button id="v-close" class="ghost">Close</button>
+    </header>
+    <div class="pair">
+      <figure><canvas id="v-photo"></canvas><figcaption>Input photo</figcaption></figure>
+      <figure><canvas id="v-render"></canvas><figcaption id="v-cap">View rendered from the candidate</figcaption></figure>
+    </div>
+  </section>
+  <section id="inspect" hidden>
+    <header>
+      <h2 id="i-title">Test run</h2>
+      <span class="legend"><i class="c1"></i>skyline found in photo <i class="c2"></i>horizon predicted at estimate <i style="background:#3ddc97"></i>true horizon / true spot <i style="background:#ffd166"></i>estimate</span>
+      <button id="i-prev" class="ghost">← Prev</button><button id="i-next" class="ghost">Next →</button>
+      <button id="i-3d" class="ghost">Show in 3D</button><button id="i-close">Close</button>
+    </header>
+    <div class="igrid">
+      <div class="icol">
+        <figure><canvas id="i-photo"></canvas><figcaption>Test photo (what the matcher was given)</figcaption></figure>
+        <div class="pair">
+          <figure><canvas id="i-est"></canvas><figcaption id="i-est-cap">View from the estimated spot</figcaption></figure>
+          <figure><canvas id="i-true"></canvas><figcaption>View from the true spot, bare terrain model (pink here = true horizon)</figcaption></figure>
+        </div>
+      </div>
+      <div class="icol side">
+        <div id="i-stats" class="kv"></div>
+        <figure><canvas id="i-map" width="520" height="520"></canvas><figcaption>Whole site (16 km), likelihood heatmap</figcaption></figure>
+        <figure><canvas id="i-zoom" width="520" height="520"></canvas><figcaption id="i-zoom-cap">Zoom</figcaption></figure>
+      </div>
+    </div>
+  </section>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
