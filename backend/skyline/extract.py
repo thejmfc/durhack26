@@ -19,7 +19,7 @@ def load_gray(data: bytes, max_width: int = 1600) -> np.ndarray:
     return np.asarray(im, np.float32) / 255.0
 
 
-def extract_skyline(gray: np.ndarray, thr: float = DEFAULT_THRESHOLD):
+def extract_skyline(gray: np.ndarray, thr: float = DEFAULT_THRESHOLD, subpixel: bool = False):
     """Per column, the first row from the top that starts 3 bright pixels (sky is black).
 
     Returns (rows, valid). A column is invalid if nothing is bright (all sky or all shadow)
@@ -29,6 +29,22 @@ def extract_skyline(gray: np.ndarray, thr: float = DEFAULT_THRESHOLD):
     b3 = b[:-2] & b[1:-1] & b[2:]
     rows = b3.argmax(axis=0)
     valid = b3.any(axis=0) & (rows > 0)
+    if subpixel:
+        # The blurred threshold is a detector, not the geometric boundary. Its
+        # first bright row moves with surface brightness and can be a pixel
+        # above the silhouette. Locate the half-contrast crossing in the ORIGINAL
+        # pixels, whose sample centres lie at row + 0.5. Do not use DEM/truth.
+        cols = np.arange(gray.shape[1])
+        offsets = np.arange(-3, 7)
+        window = gray[np.clip(rows[None, :] + offsets[:, None], 0, len(gray) - 1), cols[None, :]]
+        background = np.median(window[:2], axis=0)
+        foreground = np.median(window[-3:], axis=0)
+        target = (background + foreground) / 2
+        crossing = (window[1:] >= target) & (window[:-1] < target)
+        first = crossing.argmax(axis=0)
+        lo, hi = window[first, cols], window[first + 1, cols]
+        rows = rows + offsets[first] + .5 + (target - lo) / np.maximum(hi - lo, 1e-6)
+        valid &= crossing.any(axis=0) & (foreground - background >= .06) & (rows > 0) & (rows < len(gray))
     return rows.astype(np.float32), valid
 
 

@@ -31,13 +31,13 @@ class Query:
 
 
 def build_query(images: list[np.ndarray], hfov: float, pitch: float = 0.0, yaws=None,
-                thr: float = DEFAULT_THRESHOLD) -> Query:
+                thr: float = DEFAULT_THRESHOLD, subpixel: bool = False) -> Query:
     """images: grayscale arrays taken from one spot with known relative yaw (deg); one image is the usual case."""
     yaws = yaws or [0.0] * len(images)
     az_all, el_all, infos = [], [], []
     for g, yaw in zip(images, yaws):
         h, w = g.shape
-        rows, valid = extract_skyline(g, thr)
+        rows, valid = extract_skyline(g, thr, subpixel=subpixel)
         az, el = skyline_angles(rows, valid, w, h, hfov, pitch, yaw)
         az_all.append(az)
         el_all.append(el)

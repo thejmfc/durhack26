@@ -1,0 +1,11 @@
+numpy
+numba
+rasterio
+certifi
+pyproj
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+scipy
+matplotlib

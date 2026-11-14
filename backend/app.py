@@ -1,19 +1,21 @@
 """Skyline backend: FastAPI wrapper around the localisation pipeline.
 
-run: .venv/bin/uvicorn app:app --app-dir backend --port 8077
+run: backend/.venv/bin/uvicorn app:app --app-dir backend --port 8077 --reload
 """
 from __future__ import annotations
 
 import base64
 import json
+import math
 import threading
 import time
 from pathlib import Path
 
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
+from skyline import moon, moon_detail, moon_surface, moon_native
 from skyline.extract import DEFAULT_THRESHOLD
 from skyline.locate import (analyse_truth, build_query, classify_failure, credible_rank, load_gray,
                             locate, project_profile, skyline_overlay)
@@ -47,7 +49,6 @@ def get_site(site: str):
         return load_terrain(site), _dbs[site]
 
 
-horizons(*(lambda t, d: (t, d.rows[:4], d.cols[:4]))(*get_site(DEFAULT_SITE)))  # JIT warm-up
 
 
 def _eval_summary():
@@ -173,3 +174,115 @@ def eval_record(meta: str = Form(...), files: list[UploadFile] = File(...)):
         (d / Path(f.filename).name).write_bytes(f.file.read())
     (d / "meta.json").write_text(json.dumps(m))
     return dict(ok=True)
+
+
+@app.get("/api/moon/meta")
+def moon_meta():
+    ready = moon.database_ready()
+    try:
+        build = json.loads((moon.DB_DIR / 'build.json').read_text())
+        if time.time() - build['updated'] > 180:
+            build = None
+    except (OSError, ValueError, KeyError):
+        build = None
+    return dict(ready=ready, radius=moon.RADIUS,
+                features=dict(photo_analysis=True),
+                observer_height=moon.OBSERVER_HEIGHT,
+                terrain_model=moon_surface.specification(), build=build,
+                native_regions=sum(moon_native.prepared(s) for s in moon_native.SOURCES),
+                native_regions_total=len(moon_native.SOURCES),
+                grid=moon.database()[0] if ready else None)
+
+
+@app.get("/api/moon/detail")
+def moon_detail_endpoint(lat: float, lon: float):
+    if not math.isfinite(lat) or not math.isfinite(lon) or not -90 <= lat <= 90 or not -180 <= lon <= 180:
+        raise HTTPException(422, 'Invalid lunar coordinates')
+    job = moon_detail.request_patch(lat, lon)
+    if job['state'] == 'ready':
+        return Response(job['data'], media_type='application/octet-stream',
+                        headers={'X-Terrain-Meta': json.dumps(job['meta'])})
+    if job['state'] == 'error':
+        raise HTTPException(503, job['message'])
+    return JSONResponse({'state': job['state'], 'message': job['message']}, status_code=202)
+
+
+def moon_photo_inputs(params, files):
+    """Shared photo validation/extraction; no retrieval or reference geometry."""
+    try:
+        p = json.loads(params)
+        if not isinstance(p, dict):
+            raise ValueError('params must be an object')
+        if p.get('truth') and p.get('terrain_model') != moon_surface.MODEL_ID:
+            raise HTTPException(409, 'This photo was rendered with a different terrain version. Refresh the page and take it again.')
+        hfov, pitch = float(p.get("hfov", 66)), float(p.get("pitch", 0))
+        method = p.get("method", "ssd")
+        if method not in METHODS or not 5 <= hfov <= 170 or not -60 <= pitch <= 60 or not 1 <= len(files) <= 8:
+            raise ValueError("invalid camera settings or photo count")
+        pano = p.get("mode") == "panorama"
+        yaws = [float(y) for y in p.get("yaws", [])] if pano else None
+        if pano and (len(yaws) != len(files) or not all(math.isfinite(y) for y in yaws)):
+            raise ValueError("one finite yaw is required per panorama image")
+        hw = None
+        if p.get("heading_hint"):
+            hh = p["heading_hint"]
+            heading, width = float(hh["heading"]), float(hh.get("half_width", 5))
+            if not math.isfinite(heading) or not 1 <= width <= 180:
+                raise ValueError("invalid heading window")
+            hw = (heading % 360, width)
+        truth = p.get("truth")
+        if truth:
+            lat, lon = float(truth["lat"]), float(truth["lon"])
+            heading = float(truth["heading"])
+            if not -90 <= lat <= 90 or not -180 <= lon <= 180 or not math.isfinite(heading):
+                raise ValueError("invalid truth coordinates")
+        grays = [load_gray(f.file.read()) for f in files]
+        if any(min(g.shape) < 3 for g in grays):
+            raise ValueError("image is too small")
+        queries = [build_query(grays, hfov, pitch, yaws, subpixel=True)] if pano else [build_query([g], hfov, pitch, subpixel=True) for g in grays]
+    except (ValueError, TypeError, KeyError, OSError) as e:
+        raise HTTPException(422, str(e)) from e
+    images = [dict(w=i["w"], h=i["h"], yaw=i["yaw"], skyline=skyline_overlay(i)) for q in queries for i in q.images]
+    usable = [q for q in queries if q.m.sum() >= 10]
+    out = dict(images=images, valid_frac=[q.valid_frac for q in queries], terrain_model=moon_surface.MODEL_ID)
+    if not usable:
+        out['error'] = "No usable skyline. Look towards a visible horizon or try a panorama."
+    return out, usable, method, hw, truth
+
+
+@app.post("/api/moon/analyse")
+def moon_analyse(params: str = Form(...), files: list[UploadFile] = File(...)):
+    """Return overlays promptly, independently of the global search database.
+
+    The reference is a display-only diagnostic. It is never used as a query.
+    Even a fully dark photo still receives its reference curve.
+    """
+    out, _, _, _, truth = moon_photo_inputs(params, files)
+    if truth:
+        with lock:
+            out['reference_horizon'] = moon.horizons([float(truth['lat'])], [float(truth['lon'])], 1440)[0].round(4).tolist()
+    return out
+
+
+@app.post("/api/moon/locate")
+def moon_locate(params: str = Form(...), files: list[UploadFile] = File(...)):
+    if not moon.database_ready():
+        raise HTTPException(503, "Global search must be rebuilt for the 59–60 m surface. Run scripts/build_moon.py.")
+    out, usable, method, hw, truth = moon_photo_inputs(params, files)
+    if not usable:
+        return out
+    start = time.time()
+    with lock:
+        # Deliberately pass no truth/location to the search. It searches the whole planet.
+        result = moon.locate(usable, method, [hw] * len(usable))
+        if truth:
+            lat, lon, heading = float(truth['lat']), float(truth['lon']), float(truth['heading'])
+            cs = result["candidates"]
+            errors = moon.distance_m(lat, lon, np.array([c["lat"] for c in cs]), np.array([c["lon"] for c in cs]))
+            out["truth"] = dict(error_m=float(errors[0]), best_of_top5_m=float(errors.min()),
+                                candidate_errors_m=errors.tolist(),
+                                heading_error_deg=abs((cs[0]["headings"][0] - heading + 180) % 360 - 180),
+                                horizon=moon.horizons([lat], [lon], 1440)[0].round(4).tolist())
+    heat = result.pop("heatmap")
+    out.update(result, heatmap=base64.b64encode(heat.astype("<f4").tobytes()).decode(), seconds=round(time.time() - start, 2))
+    return out
