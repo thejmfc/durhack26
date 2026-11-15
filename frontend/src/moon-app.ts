@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { Geo, MoonHeightField, MoonMeta } from './moon-terrain';
 import { MoonWorld } from './moon-world';
 import { loadDetail, SURFACE_MODEL } from './moon-detail';
+import { elevationDownloadEstimate } from './moon-loading';
 import { routeWaypoints } from './moon-route';
 import type { RoutePlan, RouteRequest } from './moon-route';
 import { inferno } from './world';
@@ -32,6 +33,11 @@ async function boot() {
       <div class="eyebrow">SKYLINE / LUNAR EXPLORER</div>
       <h1>The whole Moon</h1>
       <p class="sub">Explore any latitude. Stand on the surface. Find your way back from the horizon.</p>
+      <div id="moon-loading">
+        <label for="moon-load-progress">Loading lunar elevation</label>
+        <progress id="moon-load-progress" max="1"></progress>
+        <div id="moon-load-estimate" class="hint" role="status">Estimating download time…</div>
+      </div>
       <div class="row"><button id="orbit">Whole Moon</button><button id="region">Regional view</button></div>
       <p class="hint" id="nav-help">Drag to orbit · scroll to zoom · click anywhere on the Moon to stand there.</p>
       <form id="coordinates">
@@ -50,7 +56,8 @@ async function boot() {
       <label class="check"><input id="panorama" type="checkbox" checked /> 360° panorama (six photos)</label>
       <label class="check"><input id="heading-hint" type="checkbox" /> Supply heading to ±5°</label>
       <button id="test" class="primary">Take photo & locate globally</button>
-      <div id="search-state" class="hint">Checking global search…</div>
+      <div id="search-state" class="hint" role="status" aria-live="polite">Checking global search…</div>
+      <progress id="search-progress" max="1" aria-label="Global search preparation progress" hidden></progress>
       <details><summary>Locate your own photo</summary>
         <p class="hint">Single photo, using the field of view and pitch above. Search covers the whole Moon.</p>
         <input id="upload" type="file" accept="image/*" />
@@ -104,13 +111,48 @@ async function boot() {
     if (!r.ok) throw new Error(`Could not load ${url}. Prepare global terrain with scripts/build_moon.py.`);
     return r;
   }
+  async function loadElevation() {
+    const response = await get('/data/moon_elevation.bin');
+    const total = Number(response.headers.get('Content-Length'));
+    const progress = $<HTMLProgressElement>('moon-load-progress');
+    const estimate = $('moon-load-estimate');
+    if (!response.body || !Number.isFinite(total) || total <= 0 || response.headers.has('Content-Encoding')) {
+      estimate.textContent = 'Download time estimate unavailable.';
+      return response.arrayBuffer();
+    }
+    const reader = response.body.getReader(), chunks: Uint8Array[] = [];
+    let received = 0;
+    const started = performance.now();
+    progress.value = 0;
+    const updateEstimate = () => {
+      estimate.textContent = elevationDownloadEstimate(received, total, (performance.now() - started) / 1000);
+    };
+    const timer = setInterval(updateEstimate, 1000);
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.byteLength;
+        progress.value = Math.min(received / total, 1);
+        updateEstimate();
+      }
+    } finally {
+      clearInterval(timer);
+    }
+    const data = new Uint8Array(received);
+    let offset = 0;
+    for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.byteLength; }
+    return data.buffer;
+  }
   const [meta, data, colour] = await Promise.all([
     get('/data/moon.json').then((r) => r.json()) as Promise<MoonMeta>,
-    get('/data/moon_elevation.bin').then((r) => r.arrayBuffer()),
+    loadElevation(),
     new THREE.TextureLoader().loadAsync('/data/moon_color.jpg'),
   ]);
   const field = new MoonHeightField(meta, new Uint16Array(data));
   const world = new MoonWorld($<HTMLCanvasElement>('view'), field, colour);
+  $('moon-loading').hidden = true;
   let busy = false, ready = false, result: Result | null = null, truth: Geo | null = null;
   let routePicking: 'start' | 'end' | null = null, plannedRoute = false;
   let shots: HTMLCanvasElement[] = [], shotHeading = 0, shotPitch = 0, shotFov = 66;
@@ -474,15 +516,32 @@ async function boot() {
       const response = await fetch('/api/moon/meta');
       if (!response.ok) throw new Error('Backend unavailable');
       const api = await response.json(); ready = api.ready && api.terrain_model?.id === SURFACE_MODEL;
+      const progress = $<HTMLProgressElement>('search-progress');
+      progress.hidden = true;
       $('search-state').textContent = ready ? `Search ready · ${api.grid.positions.toLocaleString()} points across the whole Moon`
         : api.terrain_model?.id !== SURFACE_MODEL ? 'Restart the backend to use the current terrain model.'
+        : api.build?.phase === 'failed' ? `Global search build failed: ${api.build.message || 'See data/logs/moon-build-error.log.'} Restart the launcher to retry.`
         : api.build?.phase === 'index' ? `Building global search · ${api.build.completed.toLocaleString()} / ${api.build.total.toLocaleString()} points`
         : api.build?.phase === 'elevation' ? `Preparing global elevation · ${api.native_regions}/${api.native_regions_total} regions ready. Terrain exploration is available while this runs.`
         : `Global search needs preparation · ${api.native_regions}/${api.native_regions_total} elevation regions ready. Run scripts/build_moon.py.`;
-    } catch { ready = false; $('search-state').textContent = 'Terrain exploration is ready. Start the backend to enable global matching.'; }
+      if (!ready && api.terrain_model?.id === SURFACE_MODEL && (api.build?.phase === 'index' || api.build?.phase === 'elevation')) {
+        const completed = api.build.phase === 'index' ? api.build.completed : api.native_regions;
+        const total = api.build.phase === 'index' ? api.build.total : api.native_regions_total;
+        if (Number.isFinite(completed) && Number.isFinite(total) && total > 0) {
+          progress.value = Math.max(0, Math.min(1, completed / total));
+        } else {
+          progress.removeAttribute('value');
+        }
+        progress.hidden = false;
+      }
+    } catch { ready = false; $('search-progress').hidden = true; $('search-state').textContent = 'Terrain exploration is ready. Start the backend to enable global matching.'; }
     $<HTMLButtonElement>('test').disabled = $<HTMLButtonElement>('upload-go').disabled = !ready || busy;
     if (!ready) setTimeout(() => { void searchState(); }, 15000);
   }
   await searchState();
 }
-boot().catch((e) => { if ($('status')) $('status').textContent = (e as Error).message; console.error(e); });
+boot().catch((e) => {
+  if ($('moon-loading')) $('moon-loading').hidden = true;
+  if ($('status')) $('status').textContent = (e as Error).message;
+  console.error(e);
+});

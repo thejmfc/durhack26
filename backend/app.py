@@ -181,7 +181,7 @@ def moon_meta():
     ready = moon.database_ready()
     try:
         build = json.loads((moon.DB_DIR / 'build.json').read_text())
-        if time.time() - build['updated'] > 180:
+        if build.get('phase') != 'failed' and time.time() - build['updated'] > 180:
             build = None
     except (OSError, ValueError, KeyError):
         build = None

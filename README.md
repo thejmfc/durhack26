@@ -6,6 +6,28 @@ LOLA terrain. Results are shown as a likelihood heatmap plus top candidates, nev
 
 **Status: work in progress. Accuracy is poor and only partly measured (see below). No real photos have been tested.**
 
+## Quick start (Windows)
+
+Install Python 3.13+ and Node.js 20+, then open PowerShell in the project folder
+and run:
+
+```powershell
+.\start.ps1
+```
+
+The launcher installs missing project dependencies, downloads the global overview
+if needed, opens the explorer, and starts the complete Moon search index in the
+background. The first download and processing can take a while; allow about 35 GB
+of free disk space. The app shows download progress and an approximate remaining
+time when the browser knows the file size, plus separate progress for terrain
+regions and search index positions. You can explore while the index builds; global photo matching
+becomes available when it is ready. Completed downloads and regions are reused.
+
+Keep the terminal open while using the app; press Ctrl+C to stop the servers. The
+background build may continue after the servers stop. If it fails, its error appears
+in the app and logs are in `data/logs/`; rerun the launcher to retry. The optional
+south-pole site datasets are not included in this quick start.
+
 ## Whole-Moon exploration and matching
 
 The default URL now opens the **whole-Moon explorer**. Orbit, zoom, click any surface
@@ -105,7 +127,8 @@ python3.13 -m venv .venv
 - Git Bash or WSL is optional; all scripts work natively in PowerShell or `cmd.exe`
 - ~35 GB free disk space (compressed sources, cache, browser tiles, search index)
 
-**Setup steps:**
+**Manual setup steps:** The quick start above automates the global explorer.
+These steps also download the optional south-pole site data.
 
 1. **Download NASA data:**
    ```powershell

@@ -1,6 +1,8 @@
 import io
 import json
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -12,9 +14,44 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'backend'))
 import app as api
 from skyline.locate import Query
 from skyline.moon_surface import MODEL_ID
+from scripts import build_moon
 
 
 class GlobalApiTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows build locking')
+    def test_second_build_cannot_share_windows_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            holder = subprocess.Popen(
+                [sys.executable, '-c', "import msvcrt, sys; f=open(sys.argv[1], 'w+'); f.write('0'); f.flush(); f.seek(0); msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1); print('ready', flush=True); sys.stdin.readline()", str(Path(directory) / 'build.lock')],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            )
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), 'ready')
+                runner = "import runpy, sys; from pathlib import Path; sys.path.insert(0, 'backend'); from skyline import moon; moon.DB_DIR=Path(sys.argv[1]); sys.argv=['build_moon.py', '--index-only']; runpy.run_path('scripts/build_moon.py', run_name='__main__')"
+                result = subprocess.run([sys.executable, '-c', runner, directory], capture_output=True, text=True, timeout=30)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Could not lock the Moon build', result.stderr)
+            finally:
+                holder.communicate(input='\n', timeout=10)
+
+    def test_build_failure_is_published_and_raised(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(build_moon.moon, 'DB_DIR', Path(directory)), patch.object(build_moon, '_build_started', True), patch.object(build_moon, 'main', side_effect=RuntimeError('test failure')):
+                with self.assertRaisesRegex(RuntimeError, 'test failure'):
+                    build_moon.run_build()
+                status = json.loads((Path(directory) / 'build.json').read_text())
+                self.assertEqual(status['phase'], 'failed')
+                self.assertEqual(status['message'], 'test failure')
+
+    def test_failed_build_remains_visible_but_stale_progress_does_not(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status = Path(directory) / 'build.json'
+            with patch.object(api.moon, 'DB_DIR', Path(directory)), patch.object(api.moon, 'database_ready', return_value=False), patch.object(api.moon_native, 'SOURCES', ()):
+                status.write_text(json.dumps(dict(phase='failed', updated=0, message='disk full')))
+                self.assertEqual(api.moon_meta()['build']['message'], 'disk full')
+                status.write_text(json.dumps(dict(phase='index', updated=0)))
+                self.assertIsNone(api.moon_meta()['build'])
+
     def test_analysis_returns_reference_without_a_ready_search_database(self):
         with patch.object(api.moon, 'database_ready', return_value=False), patch.object(api, 'load_gray', return_value=np.zeros((8, 8))), patch.object(api.moon, 'horizons', return_value=np.zeros((1, 1440))), patch.object(api.moon, 'locate') as search:
             result = api.moon_analyse(json.dumps(dict(terrain_model=MODEL_ID, truth=dict(lat=0, lon=0, heading=0))), [UploadFile(io.BytesIO(b'dark'))])

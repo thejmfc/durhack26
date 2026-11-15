@@ -7,6 +7,7 @@
 .moon-app hr { border: 0; border-top: 1px solid var(--line); margin: 16px 0; }
 .moon-app details { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 12px; }
 .moon-app summary { color: var(--dim); cursor: pointer; }
+.moon-app progress { display: block; width: 100%; height: 8px; accent-color: var(--accent); margin: 4px 0 10px; }
 .moon-app #route-planner .row > button { flex: 1; min-width: 0; }
 .moon-app #route-clear { width: 100%; margin-top: 4px; }
 .moon-app #route-result { line-height: 1.5; }

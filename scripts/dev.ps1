@@ -1,3 +1,5 @@
+param([switch]$OpenBrowser)
+
 # Starts the global explorer and the optional high-resolution site workflows.
 $ErrorActionPreference = 'Stop'
 
@@ -62,7 +64,13 @@ $null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action $clean
 # Start frontend
 $env:SKYLINE_API_TARGET = "http://127.0.0.1:$BACKEND_PORT"
 Set-Location frontend
-& npm run dev -- --port $FRONTEND_PORT
+if ($OpenBrowser) {
+    & npm run dev -- --port $FRONTEND_PORT --open
+} else {
+    & npm run dev -- --port $FRONTEND_PORT
+}
+$frontendExitCode = $LASTEXITCODE
 
 # Cleanup
 & $cleanupScript
+exit $frontendExitCode
