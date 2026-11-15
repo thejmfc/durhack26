@@ -56,8 +56,8 @@ or long-range illumination simulation.
 extracts its skyline, and searches the entire Moon. The test coordinates are used only
 to draw the diagnostic reference and calculate error after the search; they do not
 restrict or seed it. Photo analysis returns the extracted/reference overlays before
-the global search finishes, and errors remain visible beside the photos. Uploads use the
-same global search. The existing completed index has 4,147,200 positions at 0.125° spacing with compact
+the global search finishes, and errors remain visible beside the photos.
+The existing completed index has 4,147,200 positions at 0.125° spacing with compact
 4° horizon profiles. Each of 96 global regions is refined independently with a
 small local beam, down to roughly 4 m position steps and full 1° profiles before
 final triangle scoring. A region cannot be thrown away just because a kilometre

@@ -66,11 +66,6 @@ async function boot() {
       <button id="test" class="primary">Take photo & locate globally</button>
       <div id="search-state" class="hint" role="status" aria-live="polite">Checking global search…</div>
       <progress id="search-progress" max="1" aria-label="Global search preparation progress" hidden></progress>
-      <details><summary>Locate your own photo</summary>
-        <p class="hint">Single photo, using the field of view and pitch above. Search covers the whole Moon.</p>
-        <input id="upload" type="file" accept="image/*" />
-        <button id="upload-go">Locate globally</button>
-      </details>
       <details><summary>Lighting</summary><label class="check"><input id="visibility-light" type="checkbox" /> Optional fill light (reveals shadows)</label>
         <label>Sun azimuth <output id="sun-az-o">60°</output><input id="sun-az" type="range" min="0" max="359" value="60" /></label>
         <label>Sun elevation <output id="sun-el-o">25°</output><input id="sun-el" type="range" min="2" max="80" value="25" /></label>
@@ -527,7 +522,7 @@ async function boot() {
   async function guarded(fn: () => Promise<void>) {
     if (locked() || !ready) return;
     busy = true; document.body.classList.add('moon-busy');
-    $<HTMLButtonElement>('test').disabled = $<HTMLButtonElement>('upload-go').disabled = true;
+    $<HTMLButtonElement>('test').disabled = true;
     try { await fn(); setStatus(''); } catch (e) {
       const message = (e as Error).message;
       setStatus(message); $('photo-progress').textContent = message;
@@ -535,7 +530,6 @@ async function boot() {
     finally {
       busy = false; document.body.classList.remove('moon-busy');
       $<HTMLButtonElement>('test').disabled = !ready || !checkpointSupport;
-      $<HTMLButtonElement>('upload-go').disabled = !ready;
     }
   }
   $('test').onclick = () => guarded(async () => {
@@ -561,19 +555,6 @@ async function boot() {
       });
     } finally { world.orbit(); sync(); }
   });
-  $('upload-go').onclick = () => guarded(async () => {
-    const file = $<HTMLInputElement>('upload').files?.[0];
-    if (!file) throw new Error('Choose a photo first.');
-    const bmp = await createImageBitmap(file), cv = document.createElement('canvas'), scale = Math.min(1, 1600 / bmp.width);
-    cv.width = Math.round(bmp.width * scale); cv.height = Math.round(bmp.height * scale); cv.getContext('2d')!.drawImage(bmp, 0, 0, cv.width, cv.height); bmp.close();
-    truth = null; result = null; shots = [cv]; shotFov = world.hfov; shotPitch = world.pitch;
-    updateMarkers();
-    $('results').hidden = true; drawPhotos();
-    setStatus('Searching the whole Moon…');
-    await match([file], { hfov: shotFov, pitch: shotPitch,
-      ...($<HTMLInputElement>('heading-hint').checked ? { heading_hint: { heading: world.heading, half_width: 5 } } : {}),
-    });
-  });
   $('clear').onclick = () => { if (locked()) return; result = null; truth = null; shots = []; $('results').hidden = $('verify').hidden = true; updateMarkers(); };
   $('photo-close').onclick = () => { $('verify').hidden = true; };
   const loop = () => {
@@ -589,7 +570,7 @@ async function boot() {
     await navigate(selectedInput(), false);
   }
   sync(); setStatus('');
-  $<HTMLButtonElement>('test').disabled = $<HTMLButtonElement>('upload-go').disabled = true;
+  $<HTMLButtonElement>('test').disabled = true;
   async function searchState() {
     try {
       const response = await fetch('/api/moon/meta');
@@ -639,7 +620,6 @@ async function boot() {
       $('checkpoint-note').textContent = 'Prepared viewpoints are unavailable while the backend cannot be reached.';
     }
     $<HTMLButtonElement>('test').disabled = !ready || !checkpointSupport || busy;
-    $<HTMLButtonElement>('upload-go').disabled = !ready || busy;
     $<HTMLButtonElement>('stand').disabled = !ready || !checkpointSupport;
     setTimeout(() => { void searchState(); }, 15000);
   }
