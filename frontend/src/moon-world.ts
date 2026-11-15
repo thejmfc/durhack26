@@ -18,6 +18,7 @@ export class MoonWorld {
   private eye = new THREE.Vector3();
   private material: THREE.MeshLambertMaterial;
   private sunAz = 60; private sunEl = 25;
+  private markerKey = '';
   onMove?: () => void;
   constructor(public canvas: HTMLCanvasElement, public field: MoonHeightField, colour: THREE.Texture) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
@@ -90,13 +91,14 @@ export class MoonWorld {
   surface(geo: Geo) {
     this.terrain.surfaceOnly = true;
     this.selected = geo; this.mode = 'surface'; this.controls.enabled = false;
-    this.eye.copy(this.field.point(geo.lat, geo.lon)).setLength(this.field.meta.radius + this.terrain.height(geo) + this.field.meta.observer_height);
+    const observerHeight = this.terrain.detail?.data.meta.observer_height ?? this.field.meta.observer_height;
+    this.eye.copy(this.field.point(geo.lat, geo.lon)).setLength(this.field.meta.radius + this.terrain.height(geo) + observerHeight);
     this.camera.position.copy(this.eye); this.terrain.update(this.camera, true);
     // Stand on the actual rendered triangle, avoiding sub-pixel height differences.
     const up = this.field.frame(geo).up;
     const ray = new THREE.Raycaster(this.eye.clone().addScaledVector(up, 20000), up.clone().negate());
     const ground = this.terrain.pick(ray);
-    if (ground) this.eye.copy(ground.point).addScaledVector(up, this.field.meta.observer_height);
+    if (ground) this.eye.copy(ground.point).addScaledVector(up, observerHeight);
     this.setSun(this.sunAz, this.sunEl); this.onMove?.();
   }
   setSun(az: number, el: number) {
@@ -125,13 +127,30 @@ export class MoonWorld {
     const hit = this.terrain.pick(ray);
     return hit ? this.field.geo(hit.point) : null;
   }
-  setMarkers(points: { geo: Geo; color: number }[]) {
+  setMarkers(points: { geo: Geo; color: number; truth?: boolean }[]) {
+    const key = JSON.stringify(points);
+    if (key === this.markerKey) return;
+    this.markerKey = key;
     for (const child of [...this.markers.children]) {
-      const m = child as THREE.Mesh; m.geometry.dispose(); (m.material as THREE.Material).dispose(); this.markers.remove(m);
+      child.traverse((object) => {
+        const mesh = object as THREE.Mesh;
+        mesh.geometry?.dispose();
+        if (mesh.material) (mesh.material as THREE.Material).dispose();
+      });
+      this.markers.remove(child);
     }
     for (const p of points) {
-      const marker = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 8), new THREE.MeshBasicMaterial({ color: p.color, depthTest: false }));
-      marker.position.copy(this.field.point(p.geo.lat, p.geo.lon, 100)); marker.renderOrder = 5; this.markers.add(marker);
+      const marker = new THREE.Mesh(new THREE.SphereGeometry(p.truth ? 1.2 : 1, 12, 8),
+        new THREE.MeshBasicMaterial({ color: p.color, depthTest: false, depthWrite: false, toneMapped: false }));
+      marker.userData.geo = { ...p.geo };
+      // A close candidate must not paint over the true location.
+      marker.renderOrder = p.truth ? 11 : 5;
+      if (p.truth) {
+        const rim = new THREE.Mesh(new THREE.SphereGeometry(1.55, 12, 8),
+          new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false, depthWrite: false, toneMapped: false }));
+        rim.renderOrder = 10; marker.add(rim);
+      }
+      this.markers.add(marker);
     }
   }
   setRoute(points: Geo[], spacingM = 60) {
@@ -188,7 +207,11 @@ export class MoonWorld {
     }
     this.terrain.update(this.camera);
     this.markers.visible = this.mode !== 'surface';
-    this.markers.children.forEach((m) => m.scale.setScalar(Math.max(20, this.camera.position.distanceTo(m.position) * 0.006)));
+    this.markers.children.forEach((m) => {
+      const geo = m.userData.geo as Geo;
+      m.position.copy(this.field.point(geo.lat, geo.lon)).setLength(this.field.meta.radius + this.terrain.height(geo) + 100);
+      m.scale.setScalar(Math.max(20, this.camera.position.distanceTo(m.position) * 0.006));
+    });
     this.route.visible = this.mode !== 'surface';
     this.route.children.filter((m) => m.userData.routeEndpoint).forEach((m) => {
       m.scale.setScalar(Math.max(120, this.camera.position.distanceTo(m.position) * 0.003));

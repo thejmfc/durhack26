@@ -2,10 +2,12 @@ import * as THREE from 'three';
 import type { Geo, MoonHeightField } from './moon-terrain';
 
 export const SURFACE_MODEL = 'sldem2015-lola60-clipmap-v2';
+export const SKYLINE_PIPELINE = 'lunar-skyline-v2';
 
 export interface DetailMeta extends Geo {
   n: number; steps: number[]; radius: number; resolution_m: number;
   sources: string[]; min_m: number; max_m: number; terrain_model: string;
+  surface_id: string; observer_height: number;
 }
 export interface DetailData { meta: DetailMeta; heights: Float32Array }
 
@@ -25,6 +27,7 @@ export async function loadDetail(geo: Geo, progress: (message: string) => void):
     const meta: DetailMeta = JSON.parse(r.headers.get('X-Terrain-Meta') ?? 'null');
     const heights = new Float32Array(await r.arrayBuffer());
     if (!meta || meta.terrain_model !== SURFACE_MODEL) throw new Error('Terrain versions differ. Restart the backend and refresh this page.');
+    if (!meta.surface_id || !Number.isFinite(meta.observer_height)) throw new Error('The backend is serving older terrain. Restart it in VS Code, then refresh this page.');
     if (meta.n !== 257 || meta.steps.length !== 7 || heights.length !== meta.n * meta.n * meta.steps.length
       || !heights.every(Number.isFinite) || meta.steps.some((s, i) => s !== 60 * 2 ** i)) throw new Error('Incomplete detailed elevation data.');
     return { meta, heights };

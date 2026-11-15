@@ -8,15 +8,16 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from functools import lru_cache
 
 import numpy as np
-from numba import njit, prange
+from numba import njit, prange, get_num_threads, set_num_threads
 from PIL import Image
 from scipy.optimize import minimize
 
 from .locate import Query
-from .match import Spectra, score_profiles
+from .moon_match import score, exact_score
 from .terrain import ROOT
 
 RADIUS = 1_737_400.0
@@ -144,21 +145,16 @@ def _load_database(directory, manifest):
     from pathlib import Path
     meta = json.loads(manifest)
     directory = Path(directory)
-    return meta, np.load(directory / meta['horizons'], mmap_mode='r'), np.load(directory / meta['positions_file'])
+    return meta, np.load(directory / meta['horizons'], mmap_mode='r'), np.load(directory / meta['positions_file'], mmap_mode='r')
 
 
-def score(hz, queries, method, heading_windows, clip=None):
-    """Bound FFT working memory, including on computers with small amounts of RAM."""
-    scores, headings = [], []
-    for start in range(0, len(hz), 1024):
-        block = hz[start:start + 1024]
-        if clip is not None:
-            block = np.clip(block, -clip, clip)
-        f = Spectra(block)
-        parts = [score_profiles(f, q.q, q.m, method, heading_window=w) for q, w in zip(queries, heading_windows)]
-        scores.append(np.sum([p[0] for p in parts], axis=0))
-        headings.append(np.stack([p[1] for p in parts], axis=1))
-    return np.concatenate(scores), np.concatenate(headings)
+def heatmap(scores, shape):
+    """Pool any whole-Moon grid into at most 180 x 360 display cells."""
+    values = np.exp(np.maximum(scores - scores.max(), -80)).reshape(shape)
+    height, width = shape
+    rows = np.arange(min(180, height), dtype=np.int64) * height // min(180, height)
+    cols = np.arange(min(360, width), dtype=np.int64) * width // min(360, width)
+    return np.maximum.reduceat(np.maximum.reduceat(values, rows, axis=0), cols, axis=1)
 
 
 def distinct_indices(scores, lats, lons, n, separation):
@@ -189,10 +185,8 @@ def refine_regions(seed_lats, seed_lons, queries, method, heading_windows, cell_
             batches.append((a, b))
             offsets.append(offsets[-1] + len(a))
         lats, lons = np.concatenate([p[0] for p in batches]), np.concatenate([p[1] for p in batches])
-        stride = 360 // n_az
-        qs = [Query(q.q[::stride].copy(), q.m[::stride].copy(), max(1, q.n_expected // stride)) for q in queries]
         hw = [(w[0], min(180, w[1] + 180 / n_az)) if w is not None and n_az < 360 else w for w in heading_windows]
-        ll, headings = score(proposal_horizons(lats, lons, n_az), qs, method, hw)
+        ll, headings = score(proposal_horizons(lats, lons, n_az), queries, method, hw)
         selected = []
         for start, end in zip(offsets[:-1], offsets[1:]):
             local = distinct_indices(ll[start:end], lats[start:end], lons[start:end], keep, step)
@@ -218,14 +212,14 @@ def refine_surface(lat, lon, queries, method, heading_windows):
         return float(np.degrees(np.arcsin(v[2]))), float(np.degrees(np.arctan2(v[1], v[0])))
     offsets = np.array([(x, y) for y in [-400, -200, 0, 200, 400] for x in [-400, -200, 0, 200, 400]], np.float64)
     positions = np.array([point(x) for x in offsets])
-    values, _ = score(horizons(positions[:, 0], positions[:, 1], 360), queries, method, heading_windows)
+    values, _ = exact_score(horizons(positions[:, 0], positions[:, 1], 360), queries, method, heading_windows)
     best = int(np.argmax(values))
     cache = {tuple(x): float(-v) for x, v in zip(offsets, values)}
     def loss(x):
         key = tuple(float(v) for v in x)
         if key not in cache:
             a, b = point(x)
-            cache[key] = -float(score(horizons([a], [b], 360), queries, method, heading_windows)[0][0])
+            cache[key] = -float(exact_score(horizons([a], [b], 360), queries, method, heading_windows)[0][0])
         return cache[key]
     x = offsets[best]
     minimize(loss, x, method='Nelder-Mead', bounds=[(-500, 500)] * 2,
@@ -236,17 +230,43 @@ def refine_surface(lat, lon, queries, method, heading_windows):
     return point(winner)
 
 
+def horizon_rmse(horizon, queries, headings):
+    """Angular mismatch of the actual displayed curve, at its reported heading."""
+    azimuths = np.arange(len(horizon)) * 360 / len(horizon)
+    squared, count = 0., 0
+    for query, heading in zip(queries, headings):
+        prediction = np.interp(np.arange(len(query.q)) * 360 / len(query.q) + heading,
+                               azimuths, horizon, period=360)
+        squared += float(np.sum((prediction[query.m] - query.q[query.m]) ** 2))
+        count += int(query.m.sum())
+    return math.sqrt(squared / count) if count else None
+
+
 def locate(queries: list[Query], method='ssd', heading_windows=None):
+    # Leave CPU capacity for the browser and the user's other applications.
+    previous = get_num_threads()
+    try:
+        set_num_threads(min(previous, 4))
+        return _locate(queries, method, heading_windows)
+    finally:
+        set_num_threads(previous)
+
+
+def _locate(queries: list[Query], method='ssd', heading_windows=None):
+    clock = time.perf_counter()
+    timings = {}
+    def stage(name):
+        nonlocal clock
+        now = time.perf_counter()
+        timings[name] = round(now - clock, 3)
+        clock = now
     meta, hz, pos = database()
     hw = heading_windows or [None] * len(queries)
     # Compact 4-degree profiles allow a much denser position grid at bounded memory.
     stride = 360 // meta['n_az']
-    coarse_queries = []
-    for q in queries:
-        # Stored rays are at 0, 4, 8... degrees, not averages of 4-degree bins.
-        coarse_queries.append(Query(q.q[::stride].copy(), q.m[::stride].copy(), max(1, q.n_expected // stride)))
     coarse_hw = [(w[0], min(180, w[1] + stride / 2)) if w is not None else None for w in hw]
-    ll, headings = score(hz, coarse_queries, method, coarse_hw)
+    ll, headings = score(hz, queries, method, coarse_hw)
+    stage('global_search')
     lats, lons = pos[:, 0], pos[:, 1]
     coarse = ll.copy()
     # First cover the cells surrounding each independent global peak, then refine.
@@ -257,51 +277,50 @@ def locate(queries: list[Query], method='ssd', heading_windows=None):
     # shape. Retrieve additional regions with that amplitude capped, while
     # retaining EVERY original region. Full, uncapped horizons decide all local
     # refinement, final scores and displayed curves.
-    clipped_queries = [Query(np.clip(q.q, -1., 1.), q.m.copy(), q.n_expected) for q in coarse_queries]
+    clipped_queries = [Query(np.clip(q.q, -1., 1.), q.m.copy(), q.n_expected) for q in queries]
     if any(q.m.any() and np.std(q.q[q.m]) >= .03 for q in clipped_queries):
         alternate, _ = score(hz, clipped_queries, 'ssd', coarse_hw, clip=1.)
         extra = distinct_indices(alternate, lats, lons, 64, cell_m)
         for i in extra:
             if np.all(distance_m(lats[i], lons[i], lats[picks], lons[picks]) > 500.):
                 picks.append(i)
+    stage('alternate_retrieval')
     lats, lons, ll, headings = refine_regions(lats[picks], lons[picks], queries, method, hw, cell_m)
+    stage('regional_refinement')
     picks = distinct_indices(ll, lats, lons, 24, 500.)
     # Re-rank using the actual rendered triangles, not the approximate global
     # proposal rays. Candidate scores, headings and displayed curves agree.
     lats, lons = lats[picks], lons[picks]
     final_hz = horizons(lats, lons, 1440)
-    ll, headings = score(final_hz[:, ::4], queries, method, hw)
+    ll, headings = exact_score(final_hz, queries, method, hw)
     for i in distinct_indices(ll, lats, lons, 3, 1000.):
         lat, lon = refine_surface(float(lats[i]), float(lons[i]), queries, method, hw)
         refined = horizons([lat], [lon], 1440)[0]
-        improved, _ = score(refined[None, ::4], queries, method, hw)
+        improved, _ = exact_score(refined[None], queries, method, hw)
         if improved[0] >= ll[i]:
             lats[i], lons[i], final_hz[i] = lat, lon, refined
-    ll, headings = score(final_hz[:, ::4], queries, method, hw)
+    ll, headings = exact_score(final_hz, queries, method, hw)
+    stage('exact_refinement')
+    residuals = np.asarray([horizon_rmse(h, queries, angles) for h, angles in zip(final_hz, headings)])
+    if method == 'ssd':
+        # Rank the same interpolated curves we display, avoiding float32 FFT
+        # cancellation and the discrepancy between integer and reported headings.
+        ll = -.5 / 8 * sum(q.m.sum() for q in queries) * residuals ** 2
     picks = distinct_indices(ll, lats, lons, 5, 1000.0)
     candidates = [dict(lat=float(lats[i]), lon=float(lons[i]), headings=headings[i].tolist(),
                        loglik=float(ll[i]), rel_likelihood=float(np.exp(ll[i] - ll[picks[0]])),
+                       rmse_deg=float(residuals[i]),
                        horizon=final_hz[i].round(3).tolist()) for i in picks]
     # Relative fit per cell, deliberately not labelled as calibrated probability.
-    heat = np.exp(np.maximum(coarse - coarse.max(), -80)).reshape(meta['shape'])
-    factor = max(1, int(round(1 / meta['spacing_deg'])))
-    h, w = heat.shape
-    heat = heat.reshape(h // factor, factor, w // factor, factor).max(axis=(1, 3))
+    heat = heatmap(coarse, meta['shape'])
     # Measure the actual angular residual at the reported (sub-degree) heading.
     # A likelihood/NCC score is not itself an angular error or a confidence.
-    rmses = []
-    azimuths = np.arange(final_hz.shape[1]) * 360 / final_hz.shape[1]
-    for i in picks:
-        squared = 0.
-        for j, q in enumerate(queries):
-            prediction = np.interp(np.arange(360) + headings[i, j], azimuths, final_hz[i], period=360)
-            squared += np.sum((prediction[q.m] - q.q[q.m]) ** 2)
-        rmses.append(math.sqrt(squared / sum(q.m.sum() for q in queries)))
+    rmses = residuals[picks].tolist()
     rmse = rmses[0]
     fit_gap = max(0., min(rmses[1:]) - rmse) if len(rmses) > 1 else 0.
     relief = float(np.mean([np.std(q.q[q.m]) for q in queries]))
     # These are rejection heuristics, not a calibrated confidence probability.
     weak = relief < 0.25 or rmse > 0.2 or fit_gap < 0.1 or sum(q.m.sum() for q in queries) < 100
-    return dict(candidates=candidates, heatmap=heat, grid=dict(meta, shape=list(heat.shape)), method=method,
+    return dict(candidates=candidates, heatmap=heat, grid=dict(meta, shape=list(heat.shape)), method=method, timings=timings,
                 quality=dict(weak=bool(weak), rmse_deg=rmse, relief_deg=relief, fit_gap_deg=fit_gap,
                              message='No reliable global fix: the skyline is ambiguous, incomplete, or poorly matched.' if weak else 'Unverified global candidate; a close skyline fit does not establish the location.'))

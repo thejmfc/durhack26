@@ -10,6 +10,7 @@ from scipy.ndimage import uniform_filter
 from .match import N_AZ
 
 DEFAULT_THRESHOLD = 0.10
+LUNAR_PIPELINE = 'lunar-skyline-v2'
 
 
 def load_gray(data: bytes, max_width: int = 1600) -> np.ndarray:
@@ -45,6 +46,59 @@ def extract_skyline(gray: np.ndarray, thr: float = DEFAULT_THRESHOLD, subpixel: 
         lo, hi = window[first, cols], window[first + 1, cols]
         rows = rows + offsets[first] + .5 + (target - lo) / np.maximum(hi - lo, 1e-6)
         valid &= crossing.any(axis=0) & (foreground - background >= .06) & (rows > 0) & (rows < len(gray))
+    return rows.astype(np.float32), valid
+
+
+def extract_lunar_skyline(gray: np.ndarray):
+    """Measure visible black-sky silhouettes, including dimly lit terrain.
+
+    Estimate the sky/noise floor from the top of the photo, rather than requiring
+    10% brightness. Find a sustained edge, then measure its half-contrast position
+    in the original pixels. Entirely unlit sections have no observable silhouette;
+    abrupt lower sections consistent with shadow boundaries are left unmeasured.
+    No terrain, location, reference curve or illumination mask enters detection.
+    """
+    h, w = gray.shape
+    sky = gray[:max(3, h // 12)]
+    background = float(np.median(sky))
+    # Clipped sensor noise often has a zero median/MAD in black sky. Its upper
+    # Gaussian quantile still measures the noise instead of treating it as edges.
+    noise = max(float(np.median(np.abs(sky - background))) * 1.4826,
+                float(np.percentile(sky, 84.13)) - background)
+    threshold = background + max(2 / 255, 5 * noise)
+    # Vertical filtering avoids spreading adjacent lit ground into a black column.
+    bright = uniform_filter(gray, (3, 1)) > threshold
+    sustained = bright[:-2] & bright[1:-1] & bright[2:]
+    base = sustained.argmax(axis=0)
+    valid = sustained.any(axis=0) & (base > 0) & (base < h - 5)
+    cols = np.arange(w)
+    offsets = np.arange(-3, 7)
+    window = gray[np.clip(base[None, :] + offsets[:, None], 0, h - 1), cols[None, :]]
+    low, high = np.median(window[:2], axis=0), np.median(window[-3:], axis=0)
+    target = (low + high) / 2
+    crossing = (window[1:] >= target) & (window[:-1] < target)
+    first = crossing.argmax(axis=0)
+    lo, hi = window[first, cols], window[first + 1, cols]
+    rows = base + offsets[first] + .5 + (target - lo) / np.maximum(hi - lo, 1e-6)
+    valid &= (crossing.any(axis=0) & (high - low >= max(3 / 255, 6 * noise))
+              & (rows > 0) & (rows < h))
+
+    # A shadow touching the sky can look like a lower skyline. Reject a lower
+    # run bounded by abrupt drops from its visible neighbours. Do not join the
+    # gap or manufacture observations where the photograph has no evidence.
+    observed = valid.copy()
+    jump = max(4., h * .01)
+    cuts = np.r_[0, np.flatnonzero((np.abs(np.diff(rows)) > jump) | ~observed[:-1] | ~observed[1:]) + 1, w]
+    for start, end in zip(cuts[:-1], cuts[1:]):
+        if not observed[start:end].all():
+            continue
+        drops = []
+        if start > 0 and observed[start - 1]:
+            drops.append(rows[start] - rows[start - 1])
+        if end < w and observed[end]:
+            drops.append(rows[end - 1] - rows[end])
+        if drops and all(drop > jump for drop in drops):
+            valid[start:end] = False
     return rows.astype(np.float32), valid
 
 

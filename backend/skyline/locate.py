@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .extract import (DEFAULT_THRESHOLD, extract_skyline, load_gray, profile_from_points,
+from .extract import (DEFAULT_THRESHOLD, extract_skyline, extract_lunar_skyline, load_gray, profile_from_points,
                       project_profile, skyline_angles)
 from .horizon import horizons
 from .match import MARGIN_M, N_AZ, HorizonDB, Spectra, score_profiles
@@ -31,13 +31,13 @@ class Query:
 
 
 def build_query(images: list[np.ndarray], hfov: float, pitch: float = 0.0, yaws=None,
-                thr: float = DEFAULT_THRESHOLD, subpixel: bool = False) -> Query:
+                thr: float = DEFAULT_THRESHOLD, subpixel: bool = False, lunar: bool = False) -> Query:
     """images: grayscale arrays taken from one spot with known relative yaw (deg); one image is the usual case."""
     yaws = yaws or [0.0] * len(images)
     az_all, el_all, infos = [], [], []
     for g, yaw in zip(images, yaws):
         h, w = g.shape
-        rows, valid = extract_skyline(g, thr, subpixel=subpixel)
+        rows, valid = extract_lunar_skyline(g) if lunar else extract_skyline(g, thr, subpixel=subpixel)
         az, el = skyline_angles(rows, valid, w, h, hfov, pitch, yaw)
         az_all.append(az)
         el_all.append(el)

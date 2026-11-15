@@ -11,10 +11,56 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'backend'))
 from skyline import moon, moon_surface as surface, moon_native
-from skyline.moon_detail import sample, source_at
+from skyline.moon_detail import sample, source_at, build_patch, _source_patch
 
 
 class SharedSurfaceTests(unittest.TestCase):
+    def test_patch_identifier_survives_browser_negative_zero_round_trip(self):
+        def delivery(lat, lon, progress):
+            return dict(lat=lat, lon=lon, n=3, steps=[60], radius=surface.RADIUS,
+                        terrain_model=surface.MODEL_ID), np.zeros((1, 3, 3), '<f4').tobytes()
+        with patch('skyline.moon_native.ready', return_value=False), patch('skyline.moon_detail._source_patch', side_effect=delivery):
+            before, _ = build_patch(-0., -0.)
+            after, _ = build_patch(0., 0.)
+        self.assertEqual(before['surface_id'], after['surface_id'])
+
+    @unittest.skipUnless(moon.database_ready(), 'Global horizon index is not installed')
+    def test_optimized_proposals_preserve_the_published_index(self):
+        meta, stored, positions = moon.database()
+        indices = np.random.default_rng(20261115).choice(len(positions), 12, replace=False)
+        points = positions[indices]
+        actual = surface.proposal_horizons(points[:, 0], points[:, 1], meta['n_az'])
+        np.testing.assert_allclose(actual, stored[indices], atol=.00001, rtol=0)
+
+    @unittest.skipUnless(moon_native.ready(), 'Native global elevation cache is not installed')
+    def test_fast_mesh_is_the_delivered_browser_mesh_at_seams_and_poles(self):
+        maps, coarse = moon_native.all_maps(), moon.elevation()
+        for lat, lon in [(20., 155.), (0., 0.), (60., 45.), (-60., 180.), (89.9, 30.), (-89.9, -150.)]:
+            meta, binary = build_patch(lat, lon)
+            expected = np.frombuffer(binary, '<f4').reshape(len(meta['steps']), meta['n'], meta['n'])
+            steps = np.asarray(meta['steps'], float)
+            np.testing.assert_allclose(surface.exact_horizons([lat], [lon], 72)[0], surface.patch_horizons(expected, steps, 72), atol=.00001, rtol=0)
+        # Off the exact delivery boundaries, validate every generated vertex too.
+        for lat, lon in [(20.01, 155.01), (59.999, 44.999), (-60.001, 179.999)]:
+            meta, binary = _source_patch(lat, lon)
+            expected = np.frombuffer(binary, '<f4').reshape(len(meta['steps']), meta['n'], meta['n'])
+            np.testing.assert_allclose(surface.mesh_heights(maps, coarse, lat, lon), expected, atol=.001, rtol=0)
+
+    @unittest.skipUnless(moon_native.ready(), 'Native global elevation cache is not installed')
+    def test_delivered_and_candidate_horizons_share_identical_heights(self):
+        maps, coarse = moon_native.all_maps(), moon.elevation()
+        for lat, lon in [(31.7354, 30.06756), (-11.552, 26.487), (89.9, 30.)]:
+            meta, binary = build_patch(lat, lon)
+            delivered = np.frombuffer(binary, '<f4').reshape(len(meta['steps']), meta['n'], meta['n'])
+            np.testing.assert_array_equal(delivered, surface.mesh_heights(maps, coarse, lat, lon))
+            np.testing.assert_array_equal(surface.patch_horizons(delivered, np.asarray(meta['steps'], float), 360),
+                                          surface.exact_horizons([lat], [lon], 360)[0])
+            self.assertEqual(meta['observer_height'], surface.OBSERVER_HEIGHT)
+            self.assertEqual(len(meta['surface_id']), 64)
+        a, _ = build_patch(20., 155.)
+        b, _ = build_patch(20, 155)
+        self.assertEqual(a['surface_id'], b['surface_id'])
+
     @unittest.skipUnless(moon_native.ready(), 'Native global elevation cache is not installed')
     def test_real_native_sources_match_mesh_sampling_everywhere(self):
         maps = moon_native.all_maps()
@@ -79,7 +125,7 @@ class SharedSurfaceTests(unittest.TestCase):
             meta['horizons'] = 'b.npy'
             (directory / 'meta.json').write_text(json.dumps(meta))
             self.assertEqual(moon.database()[1][0, 0], 1)
-        moon._load_database.cache_clear()
+            moon._load_database.cache_clear()
 
 
 if __name__ == '__main__':

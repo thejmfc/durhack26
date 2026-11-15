@@ -10,13 +10,14 @@ import math
 import threading
 import time
 from pathlib import Path
+from functools import lru_cache
 
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from skyline import moon, moon_detail, moon_surface, moon_native
-from skyline.extract import DEFAULT_THRESHOLD
+from skyline.extract import DEFAULT_THRESHOLD, LUNAR_PIPELINE
 from skyline.locate import (analyse_truth, build_query, classify_failure, credible_rank, load_gray,
                             locate, project_profile, skyline_overlay)
 from skyline.horizon import horizons
@@ -181,17 +182,27 @@ def moon_meta():
     ready = moon.database_ready()
     try:
         build = json.loads((moon.DB_DIR / 'build.json').read_text())
-        if build.get('phase') != 'failed' and time.time() - build['updated'] > 180:
+        if build.get('phase') not in ('failed', 'paused') and time.time() - build['updated'] > 180:
             build = None
     except (OSError, ValueError, KeyError):
         build = None
     return dict(ready=ready, radius=moon.RADIUS,
-                features=dict(photo_analysis=True),
+                features=dict(photo_analysis=True, skyline_pipeline=LUNAR_PIPELINE, prepared_checkpoints=True),
                 observer_height=moon.OBSERVER_HEIGHT,
                 terrain_model=moon_surface.specification(), build=build,
                 native_regions=sum(moon_native.prepared(s) for s in moon_native.SOURCES),
                 native_regions_total=len(moon_native.SOURCES),
                 grid=moon.database()[0] if ready else None)
+
+
+@app.get('/api/moon/checkpoints')
+def moon_checkpoints(lat: float, lon: float):
+    if not math.isfinite(lat) or not math.isfinite(lon) or not -90 <= lat <= 90 or not -180 <= lon <= 180:
+        raise HTTPException(422, 'Invalid lunar coordinates')
+    if not moon.database_ready():
+        raise HTTPException(503, 'Prepared checkpoints are unavailable. Complete a global index build first.')
+    from skyline.moon_checkpoints import nearby
+    return nearby(lat, lon)
 
 
 @app.get("/api/moon/detail")
@@ -232,6 +243,8 @@ def moon_photo_inputs(params, files):
             hw = (heading % 360, width)
         truth = p.get("truth")
         if truth:
+            if not isinstance(truth.get('surface_id'), str) or not truth['surface_id']:
+                raise HTTPException(409, 'This capture has no verified terrain patch. Refresh the page and take it again.')
             lat, lon = float(truth["lat"]), float(truth["lon"])
             heading = float(truth["heading"])
             if not -90 <= lat <= 90 or not -180 <= lon <= 180 or not math.isfinite(heading):
@@ -239,12 +252,13 @@ def moon_photo_inputs(params, files):
         grays = [load_gray(f.file.read()) for f in files]
         if any(min(g.shape) < 3 for g in grays):
             raise ValueError("image is too small")
-        queries = [build_query(grays, hfov, pitch, yaws, subpixel=True)] if pano else [build_query([g], hfov, pitch, subpixel=True) for g in grays]
+        queries = [build_query(grays, hfov, pitch, yaws, lunar=True)] if pano else [build_query([g], hfov, pitch, lunar=True) for g in grays]
     except (ValueError, TypeError, KeyError, OSError) as e:
         raise HTTPException(422, str(e)) from e
     images = [dict(w=i["w"], h=i["h"], yaw=i["yaw"], skyline=skyline_overlay(i)) for q in queries for i in q.images]
     usable = [q for q in queries if q.m.sum() >= 10]
-    out = dict(images=images, valid_frac=[q.valid_frac for q in queries], terrain_model=moon_surface.MODEL_ID)
+    out = dict(images=images, valid_frac=[q.valid_frac for q in queries], terrain_model=moon_surface.MODEL_ID,
+               skyline_pipeline=LUNAR_PIPELINE)
     if not usable:
         out['error'] = "No usable skyline. Look towards a visible horizon or try a panorama."
     return out, usable, method, hw, truth
@@ -257,11 +271,24 @@ def moon_analyse(params: str = Form(...), files: list[UploadFile] = File(...)):
     The reference is a display-only diagnostic. It is never used as a query.
     Even a fully dark photo still receives its reference curve.
     """
-    out, _, _, _, truth = moon_photo_inputs(params, files)
+    out, usable, _, _, truth = moon_photo_inputs(params, files)
     if truth:
-        with lock:
-            out['reference_horizon'] = moon.horizons([float(truth['lat'])], [float(truth['lon'])], 1440)[0].round(4).tolist()
+        out['reference_horizon'] = moon_reference_horizon(float(truth['lat']), float(truth['lon']), truth['surface_id'])
+        out['surface_verified'] = True
+        if usable:
+            out['reference_rmse_deg'] = moon.horizon_rmse(out['reference_horizon'], usable, [float(truth['heading'])] * len(usable))
     return out
+
+
+@lru_cache(maxsize=32)
+def moon_reference_horizon(lat, lon, surface_id):
+    # Verify the delivered bytes before drawing a reference, independently of
+    # the global search lock. The checksum is never used to retrieve a location.
+    meta, data = moon_detail.build_patch(lat, lon)
+    if surface_id != meta['surface_id']:
+        raise HTTPException(409, 'Captured terrain differs from verification terrain. Reload the terrain and take a new photo.')
+    heights = np.frombuffer(data, '<f4').reshape(len(meta['steps']), meta['n'], meta['n'])
+    return moon_surface.patch_horizons(heights, np.asarray(meta['steps'], float), 1440).round(4).tolist()
 
 
 @app.post("/api/moon/locate")
@@ -271,8 +298,14 @@ def moon_locate(params: str = Form(...), files: list[UploadFile] = File(...)):
     out, usable, method, hw, truth = moon_photo_inputs(params, files)
     if not usable:
         return out
+    reference = None
+    if truth:
+        reference = moon_reference_horizon(float(truth['lat']), float(truth['lon']), truth['surface_id'])
+        out['surface_verified'] = True
     start = time.time()
     with lock:
+        if truth and truth.get('checkpoint_generation') and truth['checkpoint_generation'] != moon.database()[0]['horizons']:
+            raise HTTPException(409, 'The checkpoint grid changed during capture. Take a new photo from a prepared point.')
         # Deliberately pass no truth/location to the search. It searches the whole planet.
         result = moon.locate(usable, method, [hw] * len(usable))
         if truth:
@@ -282,7 +315,7 @@ def moon_locate(params: str = Form(...), files: list[UploadFile] = File(...)):
             out["truth"] = dict(error_m=float(errors[0]), best_of_top5_m=float(errors.min()),
                                 candidate_errors_m=errors.tolist(),
                                 heading_error_deg=abs((cs[0]["headings"][0] - heading + 180) % 360 - 180),
-                                horizon=moon.horizons([lat], [lon], 1440)[0].round(4).tolist())
+                                horizon=reference)
     heat = result.pop("heatmap")
     out.update(result, heatmap=base64.b64encode(heat.astype("<f4").tobytes()).decode(), seconds=round(time.time() - start, 2))
     return out

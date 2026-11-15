@@ -73,11 +73,11 @@ try {
     if ($state -eq 'needed') {
         $logs = Join-Path $root 'data\logs'
         New-Item -ItemType Directory -Force -Path $logs | Out-Null
-        Start-Process -FilePath $env:SKYLINE_PYTHON -ArgumentList 'scripts\build_moon.py', '--index-only' -WorkingDirectory $root `
+        Start-Process -FilePath $env:SKYLINE_PYTHON -ArgumentList 'scripts\build_moon.py', '--index-only', '--continuous' -WorkingDirectory $root `
             -RedirectStandardOutput (Join-Path $logs 'moon-build.log') `
             -RedirectStandardError (Join-Path $logs 'moon-build-error.log') -NoNewWindow | Out-Null
         Write-Host 'The complete search index is building in the background. Progress appears in the app.'
-        Write-Host 'Allow about 35 GB of free disk space. Build logs are in data\logs\.'
+        Write-Host 'Allow about 45 GB of free disk space. Build logs are in data\logs\.'
     } elseif ($state -eq 'building') {
         Write-Host 'A Moon search build is already in progress.'
     } elseif ($state -eq 'ready') {
