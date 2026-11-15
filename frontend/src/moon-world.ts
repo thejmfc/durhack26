@@ -11,6 +11,8 @@ export class MoonWorld {
   sun = new THREE.DirectionalLight(0xffffff, 3);
   fill = new THREE.AmbientLight(0xffffff, 0);
   markers = new THREE.Group();
+  checkpoints: THREE.Points;
+  private checkpointGeos: Geo[] = [];
   mode: 'orbit' | 'region' | 'surface' = 'orbit';
   selected: Geo = { lat: 0, lon: 0 };
   heading = 0; pitch = 0; hfov = 66;
@@ -38,7 +40,19 @@ export class MoonWorld {
     colour.wrapS = THREE.RepeatWrapping; colour.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
     this.material = new THREE.MeshLambertMaterial({ map: colour, shadowSide: THREE.DoubleSide });
     this.terrain = new MoonTerrain(field, this.material);
-    this.scene.add(this.terrain.group, this.sun, this.sun.target, this.fill, this.markers);
+    const checkpointMaterial = new THREE.PointsMaterial({ color: 0x66b7ff, size: 9, sizeAttenuation: false,
+      depthWrite: false, toneMapped: false });
+    checkpointMaterial.onBeforeCompile = (shader) => {
+      shader.fragmentShader = shader.fragmentShader.replace('#include <alphatest_fragment>', `
+        #include <alphatest_fragment>
+        float checkpointRadius = length(gl_PointCoord - vec2(0.5));
+        if (checkpointRadius > 0.5) discard;
+        diffuseColor.rgb = mix(diffuseColor.rgb, vec3(1.0), smoothstep(0.32, 0.48, checkpointRadius));
+      `);
+    };
+    this.checkpoints = new THREE.Points(new THREE.BufferGeometry(), checkpointMaterial);
+    this.checkpoints.visible = false;
+    this.scene.add(this.terrain.group, this.sun, this.sun.target, this.fill, this.markers, this.checkpoints);
     this.orbit(); this.setSun(60, 25);
     addEventListener('resize', () => this.resize()); this.resize();
     let down: { x: number; y: number } | null = null;
@@ -122,9 +136,41 @@ export class MoonWorld {
   }
   pick(x: number, y: number): Geo | null {
     const rect = this.canvas.getBoundingClientRect(), ray = new THREE.Raycaster();
+    if (this.checkpoints.visible) {
+      const positions = this.checkpoints.geometry.getAttribute('position');
+      const point = new THREE.Vector3(), projected = new THREE.Vector3(), view = new THREE.Vector3();
+      let nearest = -1, distance = 11;
+      for (let i = 0; i < this.checkpointGeos.length; i++) {
+        point.fromBufferAttribute(positions, i);
+        if (point.dot(view.copy(this.camera.position).sub(point)) <= 0) continue;
+        projected.copy(point).project(this.camera);
+        if (projected.z < -1 || projected.z > 1) continue;
+        const pixels = Math.hypot(rect.left + (projected.x + 1) * rect.width / 2 - x,
+          rect.top + (1 - projected.y) * rect.height / 2 - y);
+        if (pixels < distance) { distance = pixels; nearest = i; }
+      }
+      if (nearest >= 0) return { ...this.checkpointGeos[nearest] };
+    }
     ray.setFromCamera(new THREE.Vector2((x - rect.left) / rect.width * 2 - 1, 1 - (y - rect.top) / rect.height * 2), this.camera);
     const hit = this.terrain.pick(ray);
     return hit ? this.field.geo(hit.point) : null;
+  }
+  setCheckpoints(points: Geo[]) {
+    this.checkpointGeos = points.map((p) => ({ lat: p.lat, lon: p.lon }));
+    this.checkpoints.geometry.dispose();
+    this.checkpoints.geometry = new THREE.BufferGeometry();
+    this.checkpoints.geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(points.length * 3), 3));
+    this.refreshCheckpoints();
+  }
+  refreshCheckpoints() {
+    const positions = this.checkpoints.geometry.getAttribute('position');
+    if (!positions) return;
+    this.checkpointGeos.forEach((geo, i) => {
+      const point = this.field.point(geo.lat, geo.lon).setLength(this.field.meta.radius + this.terrain.height(geo) + 80);
+      positions.setXYZ(i, point.x, point.y, point.z);
+    });
+    positions.needsUpdate = true;
+    this.checkpoints.geometry.computeBoundingSphere();
   }
   setMarkers(points: { geo: Geo; color: number; truth?: boolean }[]) {
     const key = JSON.stringify(points);
@@ -162,6 +208,8 @@ export class MoonWorld {
       this.camera.near = Math.max(0.5, Math.min(5000, alt / 100)); this.camera.far = 2e7; this.camera.updateProjectionMatrix();
     }
     this.terrain.update(this.camera);
+    this.checkpoints.visible = this.mode !== 'surface' && this.checkpointGeos.length > 0
+      && this.camera.position.length() - this.field.meta.radius < 250000;
     this.markers.visible = this.mode !== 'surface';
     this.markers.children.forEach((m) => {
       const geo = m.userData.geo as Geo;
@@ -175,11 +223,15 @@ export class MoonWorld {
     this.orient(cam, this.selected, this.eye, heading, pitch, hfov, width / height);
     const target = new THREE.WebGLRenderTarget(width, height, { samples: 4 });
     target.texture.colorSpace = THREE.SRGBColorSpace;
-    const visible = this.markers.visible; this.markers.visible = false;
+    const visible = this.markers.visible, checkpointsVisible = this.checkpoints.visible;
+    this.markers.visible = this.checkpoints.visible = false;
     const buf = new Uint8Array(width * height * 4);
     try {
       this.renderer.setRenderTarget(target); this.renderer.render(this.scene, cam); this.renderer.readRenderTargetPixels(target, 0, 0, width, height, buf);
-    } finally { this.renderer.setRenderTarget(null); target.dispose(); this.markers.visible = visible; }
+    } finally {
+      this.renderer.setRenderTarget(null); target.dispose();
+      this.markers.visible = visible; this.checkpoints.visible = checkpointsVisible;
+    }
     const cv = document.createElement('canvas'); cv.width = width; cv.height = height;
     const ctx = cv.getContext('2d')!, im = ctx.createImageData(width, height);
     for (let r = 0; r < height; r++) im.data.set(buf.subarray((height - r - 1) * width * 4, (height - r) * width * 4), r * width * 4);
