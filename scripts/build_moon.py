@@ -17,18 +17,30 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'backend'))
 from skyline import moon
-from skyline import moon_native, moon_surface
+from skyline import moon_native, moon_build
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--spacing', type=float, default=0.125, help='global search grid spacing in degrees')
+    spacing = ap.add_mutually_exclusive_group()
+    spacing.add_argument('--spacing', type=float, help='legacy grid spacing in degrees; must divide 180')
+    spacing.add_argument('--spacing-km', type=float, default=1.5, help='maximum surface grid spacing in km (default: 1.5)')
     ap.add_argument('--azimuths', type=int, choices=[90, 180, 360], default=90)
+    ap.add_argument('--max-minutes', type=float, default=20, help='time budget for this index pass; rerun to resume (default: 20)')
+    ap.add_argument('--workers', type=int, choices=[1, 2, 3, 4], default=4)
+    ap.add_argument('--plan', action='store_true', help='show grid size, storage and resumable progress without rebuilding')
     ap.add_argument('--assets-only', action='store_true')
     ap.add_argument('--force', action='store_true')
     args = ap.parse_args()
-    if not 0.0625 <= args.spacing <= 10 or abs(round(180 / args.spacing) * args.spacing - 180) > 1e-8:
-        ap.error('spacing must divide 180 degrees and be between 0.0625 and 10')
+    if not np.isfinite(args.max_minutes) or args.max_minutes <= 0:
+        ap.error('max-minutes must be positive')
+    try:
+        config = moon_build.plan(args.spacing_km, args.spacing, args.azimuths)
+    except ValueError as exc:
+        ap.error(str(exc))
+    if args.plan:
+        print(json.dumps(moon_build.describe(config), indent=2))
+        return
     out = ROOT / 'frontend/public/data'
     out.mkdir(parents=True, exist_ok=True)
     with Image.open(ROOT / 'data/raw/ldem_16_uint.tif') as im:
@@ -63,15 +75,15 @@ def main():
         return
     if moon.database_ready() and not args.force:
         old = json.loads((moon.DB_DIR / 'meta.json').read_text())
-        if old['spacing_deg'] == args.spacing and old['n_az'] == args.azimuths:
+        if old['shape'] == config['shape'] and old['n_az'] == args.azimuths:
             print('Global search database already exists; use --force to rebuild.')
             return
     moon.DB_DIR.mkdir(parents=True, exist_ok=True)
-    def status(phase, completed=0, total=0):
+    def status(phase, completed=0, total=0, **extra):
         # Download workers report concurrently; each publication needs its own
         # temporary name so one worker cannot replace another worker's file.
         with tempfile.NamedTemporaryFile(mode='w', prefix='build-', suffix='.json.partial', dir=moon.DB_DIR, delete=False) as handle:
-            json.dump(dict(phase=phase, completed=completed, total=total, updated=time.time()), handle)
+            json.dump(dict(phase=phase, completed=completed, total=total, updated=time.time(), **extra), handle)
             pending = Path(handle.name)
         pending.replace(moon.DB_DIR / 'build.json')
     status('elevation')
@@ -85,45 +97,7 @@ def main():
             status('elevation')
     moon_native.prepare_all(progress)
     print('All 34 native elevation regions are ready. Building approximate horizon curves from these same elevations; no comparison images are generated.', flush=True)
-    # Build a separate generation. Existing readers keep valid memory maps, even during a rebuild.
-    generation = Path(tempfile.mkdtemp(prefix='grid-', dir=moon.DB_DIR))
-    lat = np.arange(90 - args.spacing / 2, -90, -args.spacing)
-    lon = np.arange(-180 + args.spacing / 2, 180, args.spacing)
-    lons, lats = np.meshgrid(lon, lat)
-    pos = np.stack([lats.ravel(), lons.ravel()], axis=1)
-    np.save(generation / 'positions.npy', pos)
-    data = np.lib.format.open_memmap(generation / 'horizons.npy', mode='w+', dtype=np.float32, shape=(len(pos), args.azimuths))
-    start = time.time()
-    done = 0
-    status('index', 0, len(pos))
-    # Neighbouring positions reuse native pages. Latitude-wide batches thrash
-    # the 26 GB elevation cache and make a build needlessly memory intensive.
-    for row in range(0, len(lat), 16):
-        for col in range(0, len(lon), 64):
-            rr, cc = np.meshgrid(np.arange(row, min(row + 16, len(lat))),
-                                 np.arange(col, min(col + 64, len(lon))), indexing='ij')
-            indices = (rr * len(lon) + cc).ravel()
-            p = pos[indices]
-            values = moon.proposal_horizons(p[:, 0], p[:, 1], args.azimuths)
-            if not np.isfinite(values).all() or np.any(values <= -89):
-                raise ValueError('Missing elevations in the global index; no database was published')
-            data[indices] = values
-            done += len(p)
-            if done % 16384 == 0 or done == len(pos):
-                data.flush()
-                status('index', done, len(pos))
-                print(f'{done}/{len(pos)} positions, {time.time() - start:.1f}s', flush=True)
-    data.flush()
-    meta = dict(version=moon.DB_VERSION, spacing_deg=args.spacing, shape=[len(lat), len(lon)],
-                positions=len(pos), source=info, terrain_model=moon_surface.specification(),
-                index_method=moon_surface.INDEX_METHOD, native_sources=[s.name for s in moon_native.SOURCES],
-                horizons=f'{generation.name}/horizons.npy', positions_file=f'{generation.name}/positions.npy',
-                max_range_m=float(moon_surface.PROPOSAL_RANGES[-1]), n_az=args.azimuths, dem=moon.dem_path().name)
-    pending = generation / 'meta.json'
-    pending.write_text(json.dumps(meta, indent=2))
-    pending.replace(moon.DB_DIR / 'meta.json')
-    status('ready', len(pos), len(pos))
-    print('Whole-Moon search database ready.', flush=True)
+    moon_build.build(config, info, status, args.max_minutes, args.workers)
 
 
 if __name__ == '__main__':
@@ -133,11 +107,6 @@ if __name__ == '__main__':
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise SystemExit('A whole-Moon build is already running. Let that build finish.')
-        # Also recognise a build started before the advisory lock was introduced.
-        try:
-            active = json.loads((moon.DB_DIR / 'build.json').read_text())
-        except (OSError, ValueError):
-            active = {}
-        if active.get('phase') in ('elevation', 'index') and time.time() - active.get('updated', 0) < 180:
-            raise SystemExit('Another build has reported progress recently. Wait for it to finish (or three minutes after stopping it).')
+        # The advisory lock is authoritative. A checkpoint may still say
+        # 'index' after a crash, and must not prevent an immediate resume.
         main()

@@ -145,7 +145,16 @@ def _load_database(directory, manifest):
     from pathlib import Path
     meta = json.loads(manifest)
     directory = Path(directory)
-    return meta, np.load(directory / meta['horizons'], mmap_mode='r'), np.load(directory / meta['positions_file'])
+    return meta, np.load(directory / meta['horizons'], mmap_mode='r'), np.load(directory / meta['positions_file'], mmap_mode='r')
+
+
+def heatmap(scores, shape):
+    """Pool any whole-Moon grid into at most 180 x 360 display cells."""
+    values = np.exp(np.maximum(scores - scores.max(), -80)).reshape(shape)
+    height, width = shape
+    rows = np.arange(min(180, height), dtype=np.int64) * height // min(180, height)
+    cols = np.arange(min(360, width), dtype=np.int64) * width // min(360, width)
+    return np.maximum.reduceat(np.maximum.reduceat(values, rows, axis=0), cols, axis=1)
 
 
 def distinct_indices(scores, lats, lons, n, separation):
@@ -303,10 +312,7 @@ def _locate(queries: list[Query], method='ssd', heading_windows=None):
                        rmse_deg=float(residuals[i]),
                        horizon=final_hz[i].round(3).tolist()) for i in picks]
     # Relative fit per cell, deliberately not labelled as calibrated probability.
-    heat = np.exp(np.maximum(coarse - coarse.max(), -80)).reshape(meta['shape'])
-    factor = max(1, int(round(1 / meta['spacing_deg'])))
-    h, w = heat.shape
-    heat = heat.reshape(h // factor, factor, w // factor, factor).max(axis=(1, 3))
+    heat = heatmap(coarse, meta['shape'])
     # Measure the actual angular residual at the reported (sub-degree) heading.
     # A likelihood/NCC score is not itself an angular error or a confidence.
     rmses = residuals[picks].tolist()

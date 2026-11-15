@@ -96,6 +96,13 @@ async function boot() {
   let busy = false, ready = false, result: Result | null = null, truth: Geo | null = null;
   let shots: HTMLCanvasElement[] = [], shotHeading = 0, shotPitch = 0, shotFov = 66;
   const mapImage = colour.image as HTMLImageElement;
+  const updateMarkers = () => {
+    const known = truth ?? (shots.length === 0 ? world.selected : null);
+    world.setMarkers([
+      ...(result?.candidates ?? []).map((c, i) => ({ geo: { lat: c.lat, lon: c.lon }, color: i === 0 ? 0xffd166 : 0xff7a45 })),
+      ...(known ? [{ geo: known, color: 0x3ddc97, truth: true }] : []),
+    ]);
+  };
   const sync = () => {
     $('position').textContent = coords(world.selected);
     $('hud-position').textContent = coords(world.selected);
@@ -108,6 +115,7 @@ async function boot() {
     $('nav-help').textContent = world.mode === 'surface'
       ? 'Drag to look · scroll to zoom · click ground to walk · Escape for regional view.'
       : 'Drag to orbit · scroll to zoom · click the terrain to stand there.';
+    updateMarkers();
   };
   const locked = () => { if (busy) setStatus('Please wait for the current terrain load or search…'); return busy; };
   const selectedInput = (): Geo => {
@@ -251,7 +259,7 @@ async function boot() {
       const note = document.createElement('p'); note.className = 'hint';
       note.textContent = `${result.seconds}s · ${result.grid!.positions.toLocaleString()} global grid points + local refinement. Heatmap shows relative fit, not calibrated probability.`; body.append(note);
     }
-    world.setMarkers([...(truth ? [{ geo: truth, color: 0x3ddc97 }] : []), ...(result?.candidates ?? []).map((c, i) => ({ geo: c, color: i === 0 ? 0xffd166 : 0xff7a45 }))]);
+    updateMarkers();
     drawMap(); drawPhotos();
   }
   async function match(blobs: Blob[], params: Record<string, unknown>) {
@@ -298,6 +306,7 @@ async function boot() {
     $('photo-progress').textContent = '';
     const geo = { ...world.selected }; await detailAt(geo, true);
     truth = { ...world.selected }; shotHeading = world.heading; shotPitch = world.pitch;
+    updateMarkers();
     const pano = $<HTMLInputElement>('panorama').checked;
     shotFov = pano ? 66 : world.hfov;
     const yaws = pano ? [0, 60, 120, 180, 240, 300] : [0];
@@ -306,11 +315,12 @@ async function boot() {
     const blobs = await Promise.all(shots.map((c) => new Promise<Blob>((resolve, reject) =>
       c.toBlob((blob) => blob ? resolve(blob) : reject(new Error('Could not capture the photo.')), 'image/png'))));
     setStatus('Searching the whole Moon, then refining the best candidates…');
-    await match(blobs, { hfov: shotFov, pitch: shotPitch, mode: pano ? 'panorama' : 'independent', yaws,
-      truth: { ...truth, heading: shotHeading, surface_id: world.terrain.detail!.data.meta.surface_id }, terrain_model: SURFACE_MODEL,
-      ...($<HTMLInputElement>('heading-hint').checked ? { heading_hint: { heading: shotHeading, half_width: 5 } } : {}),
-    });
-    world.orbit(); sync();
+    try {
+      await match(blobs, { hfov: shotFov, pitch: shotPitch, mode: pano ? 'panorama' : 'independent', yaws,
+        truth: { ...truth, heading: shotHeading, surface_id: world.terrain.detail!.data.meta.surface_id }, terrain_model: SURFACE_MODEL,
+        ...($<HTMLInputElement>('heading-hint').checked ? { heading_hint: { heading: shotHeading, half_width: 5 } } : {}),
+      });
+    } finally { world.orbit(); sync(); }
   });
   $('upload-go').onclick = () => guarded(async () => {
     const file = $<HTMLInputElement>('upload').files?.[0];
@@ -318,13 +328,14 @@ async function boot() {
     const bmp = await createImageBitmap(file), cv = document.createElement('canvas'), scale = Math.min(1, 1600 / bmp.width);
     cv.width = Math.round(bmp.width * scale); cv.height = Math.round(bmp.height * scale); cv.getContext('2d')!.drawImage(bmp, 0, 0, cv.width, cv.height); bmp.close();
     truth = null; result = null; shots = [cv]; shotFov = world.hfov; shotPitch = world.pitch;
+    updateMarkers();
     $('results').hidden = true; drawPhotos();
     setStatus('Searching the whole Moon…');
     await match([file], { hfov: shotFov, pitch: shotPitch,
       ...($<HTMLInputElement>('heading-hint').checked ? { heading_hint: { heading: world.heading, half_width: 5 } } : {}),
     });
   });
-  $('clear').onclick = () => { if (locked()) return; result = null; truth = null; shots = []; $('results').hidden = $('verify').hidden = true; world.setMarkers([]); };
+  $('clear').onclick = () => { if (locked()) return; result = null; truth = null; shots = []; $('results').hidden = $('verify').hidden = true; updateMarkers(); };
   $('photo-close').onclick = () => { $('verify').hidden = true; };
   const loop = () => {
     world.render();
@@ -347,7 +358,10 @@ async function boot() {
       const api = await response.json();
       const currentPipeline = api.features?.skyline_pipeline === SKYLINE_PIPELINE;
       ready = api.ready && api.terrain_model?.id === SURFACE_MODEL && currentPipeline;
-      $('search-state').textContent = ready ? `Search ready · ${api.grid.positions.toLocaleString()} points across the whole Moon`
+      const activeSpacing = api.grid ? (api.grid.spacing_m ?? api.grid.spacing_deg * Math.PI / 180 * field.meta.radius) / 1000 : null;
+      const rebuild = api.build?.total > 0 && ['index', 'paused'].includes(api.build.phase)
+        ? ` · ${(api.build.spacing_m / 1000).toFixed(1)} km rebuild ${Math.round(100 * api.build.completed / api.build.total)}%${api.build.phase === 'paused' ? ' (paused; rerun the build command to resume)' : ''}` : '';
+      $('search-state').textContent = ready ? `Search ready · ${activeSpacing!.toFixed(1)} km sampling · ${api.grid.positions.toLocaleString()} points${rebuild}`
         : !currentPipeline || api.terrain_model?.id !== SURFACE_MODEL ? 'Restart the backend in VS Code to use the current skyline detector and terrain verification.'
         : api.build?.phase === 'index' ? `Building global search · ${api.build.completed.toLocaleString()} / ${api.build.total.toLocaleString()} points`
         : api.build?.phase === 'elevation' ? `Preparing global elevation · ${api.native_regions}/${api.native_regions_total} regions ready. Terrain exploration is available while this runs.`

@@ -182,17 +182,27 @@ def moon_meta():
     ready = moon.database_ready()
     try:
         build = json.loads((moon.DB_DIR / 'build.json').read_text())
-        if time.time() - build['updated'] > 180:
+        if build.get('phase') != 'paused' and time.time() - build['updated'] > 180:
             build = None
     except (OSError, ValueError, KeyError):
         build = None
     return dict(ready=ready, radius=moon.RADIUS,
-                features=dict(photo_analysis=True, skyline_pipeline=LUNAR_PIPELINE),
+                features=dict(photo_analysis=True, skyline_pipeline=LUNAR_PIPELINE, prepared_checkpoints=True),
                 observer_height=moon.OBSERVER_HEIGHT,
                 terrain_model=moon_surface.specification(), build=build,
                 native_regions=sum(moon_native.prepared(s) for s in moon_native.SOURCES),
                 native_regions_total=len(moon_native.SOURCES),
                 grid=moon.database()[0] if ready else None)
+
+
+@app.get('/api/moon/checkpoints')
+def moon_checkpoints(lat: float, lon: float):
+    if not math.isfinite(lat) or not math.isfinite(lon) or not -90 <= lat <= 90 or not -180 <= lon <= 180:
+        raise HTTPException(422, 'Invalid lunar coordinates')
+    if not moon.database_ready():
+        raise HTTPException(503, 'Prepared checkpoints are unavailable. Complete a global index build first.')
+    from skyline.moon_checkpoints import nearby
+    return nearby(lat, lon)
 
 
 @app.get("/api/moon/detail")
@@ -294,6 +304,8 @@ def moon_locate(params: str = Form(...), files: list[UploadFile] = File(...)):
         out['surface_verified'] = True
     start = time.time()
     with lock:
+        if truth and truth.get('checkpoint_generation') and truth['checkpoint_generation'] != moon.database()[0]['horizons']:
+            raise HTTPException(409, 'The checkpoint grid changed during capture. Take a new photo from a prepared point.')
         # Deliberately pass no truth/location to the search. It searches the whole planet.
         result = moon.locate(usable, method, [hw] * len(usable))
         if truth:

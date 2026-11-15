@@ -33,7 +33,7 @@ extracts its skyline, and searches the entire Moon. The test coordinates are use
 to draw the diagnostic reference and calculate error after the search; they do not
 restrict or seed it. Photo analysis returns the extracted/reference overlays before
 the global search finishes, and errors remain visible beside the photos. Uploads use the
-same global search. The index has 4,147,200 positions at 0.125° spacing with compact
+same global search. The existing completed index has 4,147,200 positions at 0.125° spacing with compact
 4° horizon profiles. Each of 96 global regions is refined independently with a
 small local beam, down to roughly 4 m position steps and full 1° profiles before
 final triangle scoring. A region cannot be thrown away just because a kilometre
@@ -98,7 +98,7 @@ the detailed verifier sees it; the alignment repair does not fix this limitation
 
 Flat, incomplete, poorly fitted or nearly tied skylines are explicitly marked as
 unreliable. These are rejection heuristics, not calibrated confidence. The global
-position grid is still about 3.8 km at the equator; it can miss a correct region
+existing position grid is still about 3.8 km at the equator; it can miss a correct region
 whose skyline changes sharply between samples. Higher mesh resolution alone does
 not solve that retrieval limitation.
 
@@ -132,9 +132,29 @@ python3.13 -m venv .venv
 ./scripts/dev.sh
 ```
 
+The default replacement grid now samples at most **1.5 km** along a meridian and
+at the equator (longitude spacing gets closer toward the poles). It contains
+26,484,642 positions and needs approximately 9.27 GiB for horizons and coordinates.
+It becomes active only after the entire generation is complete. The page shows
+the active spacing separately from the replacement's progress.
+
+Run the following in the VS Code terminal. Each pass stops and checkpoints after
+20 minutes; rerunning the same command resumes the saved generation:
+
+```bash
+backend/.venv/bin/python scripts/build_moon.py --spacing-km 1.5 --max-minutes 20
+```
+
+Add `--plan` to inspect storage and progress without building. `--workers` accepts
+1–4 (default 4), and the builder retains 2 GiB of free disk space. A measured
+throughput projection is roughly two hours for the entire 1.5 km generation;
+20 minutes will normally produce a partial, resumable generation. A denser grid
+alone does not establish the 500 m accuracy or 30 s search targets. The previous
+complete index remains active while a replacement is incomplete.
+
 `build_moon.py --assets-only` prepares exploration without matching. The 16 px/degree
 map remains a lightweight overview/fallback; the 64 px/degree map is used when present.
-Allow about 35 GB for the compressed sources, native elevation cache, browser tiles
+Allow about 45 GB for the compressed sources, native elevation cache, browser tiles
 and search index (plus room for an old index during replacement). Native arrays
 preserve the source projections, including stereographic polar caps; they are
 memory-mapped rather than all loaded into RAM. Completed regions are reused on a
@@ -144,8 +164,13 @@ so an interrupted build cannot expose a partial database. The backend reloads a
 completed generation automatically. `scripts/dev.sh` and the `fastapi dev` command
 above reload Python changes automatically. The page
 polls rebuild progress and enables matching when the compatible index is ready.
-`--spacing` and `--azimuths` control the index
+`--spacing-km` (or the legacy `--spacing` in degrees) and `--azimuths` control the index
 tradeoff; coarse settings substantially reduce recall. Data files remain git-ignored.
+
+The green location marker is shown in globe and regional views as soon as a test
+spot is selected. A captured test's true location stays pinned while inspecting
+other candidates, including failed searches. A white rim and higher draw order
+keep an overlapping candidate from hiding it. Markers remain excluded from photos.
 
 `SKYLINE_PYTHON` can select an existing Python environment. `SKYLINE_BACKEND_PORT` and
 `SKYLINE_FRONTEND_PORT` select alternate ports. The default ports remain 8077 and 5277.
@@ -181,7 +206,49 @@ The position grid needs a better global retrieval strategy; a fine-looking mesh
 or a close fit to a false candidate does not establish location. Runs took about
 59–67 seconds each on the development laptop.
 
-Reproduce with `backend/.venv/bin/python eval/eval_moon.py --output eval/runs/moon/check.json`.
+The acceptance targets are **under 500 m top-result error and under 30 seconds
+total**, across unseen locations. Neither target is currently established.
+The first two cases of a later equal-area random benchmark (seed 2026111504,
+2026-11-15) missed by 2,214 km and 4,690 km, taking 90.8 and 176.7 seconds for
+search alone. Both were rejected. That run was stopped after these failures;
+it is an incomplete baseline, not a successful accuracy evaluation.
+
+The current 0.125-degree index spaces positions about 3.79 km apart at the
+equator. A separate 32-location development check reproduced stored profiles
+exactly; at identical positions, approximate and exact mesh horizons differed
+by 0.012–0.071 degrees RMS. Moving to the nearest indexed position caused much
+larger changes. Reusing the correct elevation source does not remove this
+position-sampling problem. Local feature, spectral and interpolated-cell
+retrieval experiments did not establish adequate recall and were not enabled.
+
+The proposal kernel now shares ray geometry and takes the angular maximum
+after comparing slopes. On 3,872 positions at 90 and 360 rays, all resulting
+float32 horizons were byte-identical, with warm kernel time reduced by about
+19–20%. This is a component speed improvement, not a 30-second search result.
+
+Run the broad benchmark with:
+
+```bash
+NUMBA_NUM_THREADS=4 backend/.venv/bin/python eval/eval_moon.py --samples 32 --seed 2026111503 --output eval/runs/moon/broad.json
+```
+
+This runs 32 whole-Moon searches and can currently take substantial time.
+Locations are sampled across equal-area latitude bands, with independent
+random longitude and heading. The report counts rejected, missing and errored
+results as failures and records completed versus requested cases. Ideal-horizon
+timing excludes capture; photo-fixture timing includes decoding and extraction
+but excludes capture and HTTP. Neither can certify end-to-end browser latency.
+Final browser checks must measure the complete flow separately. The earlier
+named diagnostics remain available through repeated `--case` arguments.
+
+A bounded build-throughput probe evaluated 32,768 positions on a 0.015625-degree
+(474 m equatorial) grid with four workers. A full uniform index at that spacing
+would contain 265,420,800 profiles and occupy 89 GiB as float32. Extrapolating
+the measured kernel rate gives about 20–24 hours, before writing and indexing.
+This is an estimate, not a completed build or evidence that this spacing meets
+the accuracy target. It does not fit the requested 20-minute rebuild budget;
+no replacement index was published. A different representation and retrieval
+design must be validated before a larger rebuild is useful.
 
 ### Global code and checks
 

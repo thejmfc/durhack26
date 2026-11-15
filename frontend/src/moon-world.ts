@@ -17,6 +17,7 @@ export class MoonWorld {
   private eye = new THREE.Vector3();
   private material: THREE.MeshLambertMaterial;
   private sunAz = 60; private sunEl = 25;
+  private markerKey = '';
   onMove?: () => void;
   constructor(public canvas: HTMLCanvasElement, public field: MoonHeightField, colour: THREE.Texture) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
@@ -125,13 +126,30 @@ export class MoonWorld {
     const hit = this.terrain.pick(ray);
     return hit ? this.field.geo(hit.point) : null;
   }
-  setMarkers(points: { geo: Geo; color: number }[]) {
+  setMarkers(points: { geo: Geo; color: number; truth?: boolean }[]) {
+    const key = JSON.stringify(points);
+    if (key === this.markerKey) return;
+    this.markerKey = key;
     for (const child of [...this.markers.children]) {
-      const m = child as THREE.Mesh; m.geometry.dispose(); (m.material as THREE.Material).dispose(); this.markers.remove(m);
+      child.traverse((object) => {
+        const mesh = object as THREE.Mesh;
+        mesh.geometry?.dispose();
+        if (mesh.material) (mesh.material as THREE.Material).dispose();
+      });
+      this.markers.remove(child);
     }
     for (const p of points) {
-      const marker = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 8), new THREE.MeshBasicMaterial({ color: p.color, depthTest: false }));
-      marker.position.copy(this.field.point(p.geo.lat, p.geo.lon, 100)); marker.renderOrder = 5; this.markers.add(marker);
+      const marker = new THREE.Mesh(new THREE.SphereGeometry(p.truth ? 1.2 : 1, 12, 8),
+        new THREE.MeshBasicMaterial({ color: p.color, depthTest: false, depthWrite: false, toneMapped: false }));
+      marker.userData.geo = { ...p.geo };
+      // A close candidate must not paint over the true location.
+      marker.renderOrder = p.truth ? 11 : 5;
+      if (p.truth) {
+        const rim = new THREE.Mesh(new THREE.SphereGeometry(1.55, 12, 8),
+          new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false, depthWrite: false, toneMapped: false }));
+        rim.renderOrder = 10; marker.add(rim);
+      }
+      this.markers.add(marker);
     }
   }
   render() {
@@ -145,7 +163,11 @@ export class MoonWorld {
     }
     this.terrain.update(this.camera);
     this.markers.visible = this.mode !== 'surface';
-    this.markers.children.forEach((m) => m.scale.setScalar(Math.max(20, this.camera.position.distanceTo(m.position) * 0.006)));
+    this.markers.children.forEach((m) => {
+      const geo = m.userData.geo as Geo;
+      m.position.copy(this.field.point(geo.lat, geo.lon)).setLength(this.field.meta.radius + this.terrain.height(geo) + 100);
+      m.scale.setScalar(Math.max(20, this.camera.position.distanceTo(m.position) * 0.006));
+    });
     this.renderer.setRenderTarget(null); this.renderer.render(this.scene, this.camera);
   }
   capture(heading: number, pitch: number, hfov: number, width = 800, height = 600) {
