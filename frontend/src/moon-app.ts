@@ -13,6 +13,11 @@ const val = (id: string) => Number($<HTMLInputElement>(id).value);
 const coords = (g: Geo) => `${Math.abs(g.lat).toFixed(3)}°${g.lat < 0 ? 'S' : 'N'}, ${Math.abs(g.lon).toFixed(3)}°${g.lon < 0 ? 'W' : 'E'}`;
 const km = (m: number) => m >= 1000 ? `${(m / 1000).toFixed(1)} km` : `${Math.round(m)} m`;
 interface Candidate extends Geo { headings: number[]; horizon: number[]; rel_likelihood: number; loglik: number; rmse_deg?: number }
+interface PreparedPoints {
+  generation: string; spacing_m: number;
+  nearest: Geo & { id: number; distance_m: number };
+  points: (Geo & { id: number })[];
+}
 interface Result {
   terrain_model: string;
   skyline_pipeline: string;
@@ -41,15 +46,16 @@ async function boot() {
         <div id="moon-load-estimate" class="hint" role="status">Estimating download time…</div>
       </div>
       <div class="row"><button id="orbit">Whole Moon</button><button id="region">Regional view</button></div>
-      <p class="hint" id="nav-help">Drag to orbit · scroll to zoom · click anywhere on the Moon to stand there.</p>
+      <p class="hint" id="nav-help">Drag to orbit · scroll to zoom · click the Moon to choose a prepared viewpoint.</p>
       <form id="coordinates">
         <div class="coordinate-fields">
           <label>Latitude <input id="latitude" type="number" min="-90" max="90" step="any" value="0" required /></label>
           <label>Longitude <input id="longitude" type="number" min="-180" max="180" step="any" value="0" required /></label>
         </div>
-        <button type="submit">Go to coordinates</button><button type="button" id="stand">Stand here</button>
+        <button type="submit">Go to coordinates</button><button type="button" id="stand" disabled>Nearest viewpoint</button>
       </form>
       <p id="position" class="kv">0.000°N, 0.000°E</p>
+      <p id="checkpoint-note" class="hint">Blue dots show prepared viewpoints when zoomed in. Clicks snap to an indexed position.</p>
       <hr />
       <h2>Test from this spot</h2>
       <label>Heading <output id="heading-o">0°</output><input id="heading" type="range" min="0" max="359" value="0" /></label>
@@ -158,6 +164,7 @@ async function boot() {
   $('moon-loading').hidden = true;
   let busy = false, ready = false, result: Result | null = null, truth: Geo | null = null;
   let routePicking: 'start' | 'end' | null = null, plannedRoute = false;
+  let checkpointGeneration: string | null = null, displayedCheckpointGrid: string | null = null, checkpointSupport = false;
   let shots: HTMLCanvasElement[] = [], shotHeading = 0, shotPitch = 0, shotFov = 66;
   const mapImage = colour.image as HTMLImageElement;
   const updateMarkers = () => {
@@ -177,8 +184,8 @@ async function boot() {
       $<HTMLInputElement>(id).value = String(n); $(id + '-o').textContent = `${Math.round(n)}°`;
     }
     $('nav-help').textContent = world.mode === 'surface'
-      ? 'Drag to look · scroll to zoom · click ground to walk · Escape for regional view.'
-      : 'Drag to orbit · scroll to zoom · click the terrain to stand there.';
+      ? 'Drag to look · scroll to zoom · click ground for the nearest prepared viewpoint · Escape for regional view.'
+      : 'Drag to orbit · scroll to zoom · blue dots are prepared viewpoints. Clicking the Moon snaps to the nearest one.';
     updateMarkers();
   };
   const invalidateRoute = () => {
@@ -238,7 +245,7 @@ async function boot() {
     try {
       const waypoints = routeWaypoints(start, end, field.meta.radius);
       const sunAz = val('sun-az'), sunEl = val('sun-el');
-      await detailAt(start, false);
+      await detailAt(start, false, false);
       const detail = world.terrain.detail;
       if (!detail) throw new Error('Measured terrain did not load for the route start point.');
       world.setSun(sunAz, sunEl);
@@ -291,7 +298,29 @@ async function boot() {
     if (!Number.isFinite(lat) || !Number.isFinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) throw new Error('Enter latitude −90…90 and longitude −180…180.');
     return { lat, lon };
   };
-  async function detailAt(geo: Geo, surface: boolean) {
+  async function detailAt(geo: Geo, surface: boolean, loadCheckpoints = true) {
+    // Only navigation uses checkpoint coordinates. Captured pixels still go
+    // through the same global search, without a checkpoint ID or location prior.
+    if (surface) {
+      if (!ready || !checkpointSupport) throw new Error('Prepared viewpoints are unavailable until the global index is ready. You can still explore the globe.');
+      const points = await preparedPoints(geo);
+      geo = { lat: points.nearest.lat, lon: points.nearest.lon };
+      checkpointGeneration = points.generation;
+      $('checkpoint-note').textContent = `Prepared viewpoint · ${km(points.spacing_m)} sampling · ${km(points.nearest.distance_m)} from the selected spot.`;
+    } else if (loadCheckpoints) {
+      checkpointGeneration = null;
+      if (ready && checkpointSupport) {
+        await preparedPoints(geo);
+        $('checkpoint-note').textContent = 'Blue dots are prepared viewpoints. Click a dot or the terrain to enter the nearest one.';
+      } else {
+        world.setCheckpoints([]);
+        $('checkpoint-note').textContent = 'Prepared viewpoints will appear when the global index is ready.';
+      }
+    } else {
+      checkpointGeneration = null;
+      displayedCheckpointGrid = null;
+      world.setCheckpoints([]);
+    }
     setStatus('Loading the surrounding terrain…');
     await field.loadAround(geo);
     world.terrain.invalidate();
@@ -303,12 +332,28 @@ async function boot() {
       world.terrain.setDetail(data);
       world.renderer.shadowMap.needsUpdate = true;
     }
+    world.refreshCheckpoints();
     if (surface) {
       const centre = world.terrain.detail!.data.meta;
       world.surface({ lat: centre.lat, lon: centre.lon });
     }
     $('terrain-note').textContent = 'Surface and matching share 59–60 m measured elevations. Reference and candidate horizons follow the same terrain triangles. Global fixes remain experimental.';
     sync(); setStatus('');
+  }
+  async function preparedPoints(geo: Geo): Promise<PreparedPoints> {
+    const response = await fetch(`/api/moon/checkpoints?lat=${encodeURIComponent(geo.lat)}&lon=${encodeURIComponent(geo.lon)}`);
+    if (!response.ok) {
+      world.setCheckpoints([]);
+      const body = await response.json().catch(() => null);
+      throw new Error(body?.detail ?? 'Prepared viewpoints could not be loaded. Finish the global index build and retry.');
+    }
+    const points: PreparedPoints = await response.json();
+    if (!points.generation || !Number.isFinite(points.nearest?.lat) || !Number.isFinite(points.nearest?.lon) || !Array.isArray(points.points)) {
+      throw new Error('The backend returned an incomplete viewpoint list.');
+    }
+    world.setCheckpoints(points.points);
+    displayedCheckpointGrid = points.generation;
+    return points;
   }
   async function navigate(geo: Geo, surface: boolean) {
     if (locked()) return;
@@ -487,7 +532,11 @@ async function boot() {
       const message = (e as Error).message;
       setStatus(message); $('photo-progress').textContent = message;
     }
-    finally { busy = false; document.body.classList.remove('moon-busy'); $<HTMLButtonElement>('test').disabled = $<HTMLButtonElement>('upload-go').disabled = !ready; }
+    finally {
+      busy = false; document.body.classList.remove('moon-busy');
+      $<HTMLButtonElement>('test').disabled = !ready || !checkpointSupport;
+      $<HTMLButtonElement>('upload-go').disabled = !ready;
+    }
   }
   $('test').onclick = () => guarded(async () => {
     setStatus('Rendering the surface horizon…'); result = null;
@@ -506,7 +555,8 @@ async function boot() {
     setStatus('Searching the whole Moon, then refining the best candidates…');
     try {
       await match(blobs, { hfov: shotFov, pitch: shotPitch, mode: pano ? 'panorama' : 'independent', yaws,
-        truth: { ...truth, heading: shotHeading, surface_id: world.terrain.detail!.data.meta.surface_id }, terrain_model: SURFACE_MODEL,
+        truth: { ...truth, heading: shotHeading, surface_id: world.terrain.detail!.data.meta.surface_id,
+          checkpoint_generation: checkpointGeneration }, terrain_model: SURFACE_MODEL,
         ...($<HTMLInputElement>('heading-hint').checked ? { heading_hint: { heading: shotHeading, half_width: 5 } } : {}),
       });
     } finally { world.orbit(); sync(); }
@@ -546,12 +596,13 @@ async function boot() {
       if (!response.ok) throw new Error('Backend unavailable');
       const api = await response.json();
       const currentPipeline = api.features?.skyline_pipeline === SKYLINE_PIPELINE;
+      checkpointSupport = Boolean(api.features?.prepared_checkpoints);
       ready = api.ready && api.terrain_model?.id === SURFACE_MODEL && currentPipeline;
       const progress = $<HTMLProgressElement>('search-progress');
       progress.hidden = true;
       const activeSpacing = api.grid ? (api.grid.spacing_m ?? api.grid.spacing_deg * Math.PI / 180 * field.meta.radius) / 1000 : null;
       const rebuild = api.build?.total > 0 && ['index', 'paused'].includes(api.build.phase)
-        ? ` · ${(api.build.spacing_m / 1000).toFixed(1)} km rebuild ${Math.round(100 * api.build.completed / api.build.total)}%${api.build.phase === 'paused' ? ` (paused: ${api.build.reason || 'rerun the build command to resume'})` : ''}`
+        ? ` · ${api.build.spacing_m ? `${(api.build.spacing_m / 1000).toFixed(1)} km ` : ''}rebuild ${Math.round(100 * api.build.completed / api.build.total)}%${api.build.phase === 'paused' ? ` (paused: ${api.build.reason || 'rerun the build command to resume'})` : ''}`
         : api.build?.phase === 'failed' ? ` · rebuild failed: ${api.build.message || 'See data/logs/moon-build-error.log.'}` : '';
       $('search-state').textContent = ready ? `Search ready · ${activeSpacing!.toFixed(1)} km sampling · ${api.grid.positions.toLocaleString()} points${rebuild}`
         : !currentPipeline || api.terrain_model?.id !== SURFACE_MODEL ? 'Restart the backend to use the current skyline detector and terrain verification.'
@@ -570,8 +621,26 @@ async function boot() {
         }
         progress.hidden = false;
       }
-    } catch { ready = false; $('search-progress').hidden = true; $('search-state').textContent = 'Terrain exploration is ready. Start the backend to enable global matching.'; }
-    $<HTMLButtonElement>('test').disabled = $<HTMLButtonElement>('upload-go').disabled = !ready || busy;
+      if (ready && checkpointSupport && displayedCheckpointGrid !== api.grid.horizons && !busy) {
+        try {
+          await preparedPoints(world.selected);
+          $('checkpoint-note').textContent = 'Blue dots are prepared viewpoints when zoomed in. Clicks snap to the nearest indexed position.';
+        } catch (e) { $('checkpoint-note').textContent = (e as Error).message; }
+      }
+      if (!ready || !checkpointSupport) {
+        world.setCheckpoints([]);
+        displayedCheckpointGrid = null;
+        $('checkpoint-note').textContent = !ready ? 'Prepared viewpoints will appear when the global index is ready.'
+          : 'This backend does not yet expose prepared viewpoints. Use the committed checkpoint endpoint to enable them.';
+      }
+    } catch {
+      ready = false; $('search-progress').hidden = true; world.setCheckpoints([]); displayedCheckpointGrid = null;
+      $('search-state').textContent = 'Terrain exploration is ready. Start the backend to enable global matching.';
+      $('checkpoint-note').textContent = 'Prepared viewpoints are unavailable while the backend cannot be reached.';
+    }
+    $<HTMLButtonElement>('test').disabled = !ready || !checkpointSupport || busy;
+    $<HTMLButtonElement>('upload-go').disabled = !ready || busy;
+    $<HTMLButtonElement>('stand').disabled = !ready || !checkpointSupport;
     setTimeout(() => { void searchState(); }, 15000);
   }
   await searchState();
