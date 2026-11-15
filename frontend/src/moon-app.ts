@@ -1,24 +1,26 @@
 import * as THREE from 'three';
 import { Geo, MoonHeightField, MoonMeta } from './moon-terrain';
 import { MoonWorld } from './moon-world';
-import { loadDetail, SURFACE_MODEL } from './moon-detail';
+import { loadDetail, SURFACE_MODEL, SKYLINE_PIPELINE } from './moon-detail';
 import { inferno } from './world';
-import { toJpeg } from './photo';
 import './moon.css';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 const val = (id: string) => Number($<HTMLInputElement>(id).value);
 const coords = (g: Geo) => `${Math.abs(g.lat).toFixed(3)}°${g.lat < 0 ? 'S' : 'N'}, ${Math.abs(g.lon).toFixed(3)}°${g.lon < 0 ? 'W' : 'E'}`;
 const km = (m: number) => m >= 1000 ? `${(m / 1000).toFixed(1)} km` : `${Math.round(m)} m`;
-interface Candidate extends Geo { headings: number[]; horizon: number[]; rel_likelihood: number; loglik: number }
+interface Candidate extends Geo { headings: number[]; horizon: number[]; rel_likelihood: number; loglik: number; rmse_deg?: number }
 interface Result {
   terrain_model: string;
+  skyline_pipeline: string;
+  surface_verified?: boolean;
   quality?: { weak: boolean; message: string; rmse_deg: number; relief_deg: number };
   error?: string; candidates?: Candidate[]; heatmap?: string; seconds?: number;
   grid?: { shape: [number, number]; spacing_deg: number; positions: number };
   images: { w: number; h: number; yaw: number; skyline: [number, number][] }[];
   valid_frac: number[];
   reference_horizon?: number[];
+  reference_rmse_deg?: number;
   truth?: { error_m: number; best_of_top5_m: number; heading_error_deg: number; candidate_errors_m: number[]; horizon: number[] };
 }
 
@@ -74,6 +76,7 @@ async function boot() {
     <section id="verify" hidden>
       <header><h2 id="photo-title">Photo / skyline comparison</h2><button id="photo-close">Close</button></header>
       <p id="photo-progress" class="hint" role="status" aria-live="polite"></p>
+      <p id="photo-mismatch" class="hint"></p>
       <div class="photo-strip" id="photos"></div>
       <div class="legend"><i class="c1"></i>extracted skyline <i class="c2"></i>candidate horizon <i style="background:#3ddc97"></i>true horizon</div>
     </section>`;
@@ -118,13 +121,16 @@ async function boot() {
     world.terrain.invalidate();
     world.region(geo); sync();
     const existing = world.terrain.detail?.data.meta;
-    if (!existing || Math.abs(existing.lat - geo.lat) > 1e-7 || Math.abs(existing.lon - geo.lon) > 1e-7) {
+    if (!existing?.surface_id || Math.abs(existing.lat - geo.lat) > 1e-7 || Math.abs(existing.lon - geo.lon) > 1e-7) {
       $('terrain-note').textContent = 'Loading measured surface elevations. The surrounding globe remains visible while the region is prepared.';
       const data = await loadDetail(geo, setStatus);
       world.terrain.setDetail(data);
       world.renderer.shadowMap.needsUpdate = true;
     }
-    if (surface) world.surface(geo);
+    if (surface) {
+      const centre = world.terrain.detail!.data.meta;
+      world.surface({ lat: centre.lat, lon: centre.lon });
+    }
     $('terrain-note').textContent = 'Surface and matching share 59–60 m measured elevations. Reference and candidate horizons follow the same terrain triangles. Global fixes remain experimental.';
     sync(); setStatus('');
   }
@@ -207,6 +213,11 @@ async function boot() {
   }
   function drawPhotos(candidate = 0) {
     $('photos').replaceChildren();
+    const mismatches: string[] = [];
+    if (result?.reference_rmse_deg !== undefined) mismatches.push(`Photo vs rendered terrain: ${result.reference_rmse_deg.toFixed(3)}°`);
+    const mismatch = result?.candidates?.[candidate]?.rmse_deg;
+    if (mismatch !== undefined) mismatches.push(`Photo vs candidate: ${mismatch.toFixed(3)}°`);
+    $('photo-mismatch').textContent = mismatches.length ? `Skyline mismatch (RMSE) · ${mismatches.join(' · ')}. Lower is better.` : '';
     shots.forEach((shot, i) => {
       const cv = document.createElement('canvas'); cv.width = shot.width; cv.height = shot.height;
       const ctx = cv.getContext('2d')!; ctx.drawImage(shot, 0, 0);
@@ -245,24 +256,29 @@ async function boot() {
   }
   async function match(blobs: Blob[], params: Record<string, unknown>) {
     const form = new FormData(); form.append('params', JSON.stringify(params));
-    blobs.forEach((b, i) => form.append('files', b, `photo_${i}.jpg`));
-    const request = async (path: string, optional = false): Promise<Result | null> => {
+    blobs.forEach((b, i) => form.append('files', b, `photo_${i}.${b.type === 'image/png' ? 'png' : 'jpg'}`));
+    const request = async (path: string): Promise<Result> => {
       const r = await fetch(path, { method: 'POST', body: form });
-      // During development an older API may still be serving requests. Preserve
-      // the existing locate workflow instead of failing the whole photo action.
-      if (optional && (r.status === 404 || r.status === 405)) return null;
+      if (r.status === 404 || r.status === 405) throw new Error('The backend is out of date. Restart it in VS Code and refresh this page.');
       if (!r.ok) { const e = await r.json().catch(() => null); throw new Error(e?.detail ?? `Photo analysis failed (${r.status})`); }
       const next: Result = await r.json();
       if (next.terrain_model !== SURFACE_MODEL) throw new Error('Search and surface versions differ. Restart the backend and refresh the page.');
+      if (next.skyline_pipeline !== SKYLINE_PIPELINE) throw new Error('The backend is running an older skyline detector. Restart it in VS Code and refresh this page.');
       return next;
     };
     $('photo-progress').textContent = 'Extracting the visible skyline and drawing the reference horizon…';
-    result = await request('/api/moon/analyse', true); drawPhotos();
+    result = await request('/api/moon/analyse'); drawPhotos();
     if (result?.error) { $('photo-progress').textContent = result.error; showResult(); return; }
     $('photo-progress').textContent = result
       ? 'Horizons ready. Searching the whole Moon and refining the terrain matches…'
       : 'Searching the whole Moon. Restart the backend to show horizon overlays before the search finishes.';
-    const next = (await request('/api/moon/locate'))!;
+    const started = performance.now();
+    const timer = window.setInterval(() => {
+      $('photo-progress').textContent = `Searching the whole Moon and refining terrain matches · ${Math.round((performance.now() - started) / 1000)}s elapsed…`;
+    }, 1000);
+    let next: Result;
+    try { next = (await request('/api/moon/locate'))!; }
+    finally { window.clearInterval(timer); }
     result = { ...result, ...next }; showResult();
     $('photo-progress').textContent = next.error ?? `Search finished in ${next.seconds}s. ${next.quality?.message ?? ''}`;
   }
@@ -281,15 +297,17 @@ async function boot() {
     $('results').hidden = $('verify').hidden = true;
     $('photo-progress').textContent = '';
     const geo = { ...world.selected }; await detailAt(geo, true);
-    truth = geo; shotHeading = world.heading; shotPitch = world.pitch;
+    truth = { ...world.selected }; shotHeading = world.heading; shotPitch = world.pitch;
     const pano = $<HTMLInputElement>('panorama').checked;
     shotFov = pano ? 66 : world.hfov;
     const yaws = pano ? [0, 60, 120, 180, 240, 300] : [0];
     shots = yaws.map((yaw) => world.capture(shotHeading + yaw, shotPitch, shotFov)); drawPhotos();
-    const blobs = await Promise.all(shots.map((c) => toJpeg(c)));
+    // Keep faint silhouette pixels intact; JPEG can discard them beside black sky.
+    const blobs = await Promise.all(shots.map((c) => new Promise<Blob>((resolve, reject) =>
+      c.toBlob((blob) => blob ? resolve(blob) : reject(new Error('Could not capture the photo.')), 'image/png'))));
     setStatus('Searching the whole Moon, then refining the best candidates…');
     await match(blobs, { hfov: shotFov, pitch: shotPitch, mode: pano ? 'panorama' : 'independent', yaws,
-      truth: { ...geo, heading: shotHeading }, terrain_model: SURFACE_MODEL,
+      truth: { ...truth, heading: shotHeading, surface_id: world.terrain.detail!.data.meta.surface_id }, terrain_model: SURFACE_MODEL,
       ...($<HTMLInputElement>('heading-hint').checked ? { heading_hint: { heading: shotHeading, half_width: 5 } } : {}),
     });
     world.orbit(); sync();
@@ -326,9 +344,11 @@ async function boot() {
     try {
       const response = await fetch('/api/moon/meta');
       if (!response.ok) throw new Error('Backend unavailable');
-      const api = await response.json(); ready = api.ready && api.terrain_model?.id === SURFACE_MODEL;
+      const api = await response.json();
+      const currentPipeline = api.features?.skyline_pipeline === SKYLINE_PIPELINE;
+      ready = api.ready && api.terrain_model?.id === SURFACE_MODEL && currentPipeline;
       $('search-state').textContent = ready ? `Search ready · ${api.grid.positions.toLocaleString()} points across the whole Moon`
-        : api.terrain_model?.id !== SURFACE_MODEL ? 'Restart the backend to use the current terrain model.'
+        : !currentPipeline || api.terrain_model?.id !== SURFACE_MODEL ? 'Restart the backend in VS Code to use the current skyline detector and terrain verification.'
         : api.build?.phase === 'index' ? `Building global search · ${api.build.completed.toLocaleString()} / ${api.build.total.toLocaleString()} points`
         : api.build?.phase === 'elevation' ? `Preparing global elevation · ${api.native_regions}/${api.native_regions_total} regions ready. Terrain exploration is available while this runs.`
         : `Global search needs preparation · ${api.native_regions}/${api.native_regions_total} elevation regions ready. Run scripts/build_moon.py.`;

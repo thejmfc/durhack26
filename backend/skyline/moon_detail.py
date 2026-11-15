@@ -7,6 +7,8 @@ Source scales come from their PDS labels: int16 * 0.5 metres above 1737.4 km.
 from __future__ import annotations
 
 import math
+import hashlib
+import json
 import ssl
 import threading
 import tempfile
@@ -23,7 +25,7 @@ import certifi
 from rasterio.windows import Window
 
 from .terrain import ROOT
-from .moon_surface import N, STEPS, FINE_LEVELS, MODEL_ID, coarse_samples
+from .moon_surface import N, STEPS, FINE_LEVELS, MODEL_ID, OBSERVER_HEIGHT, coarse_samples, mesh_heights, source_boundary
 
 RADIUS = 1_737_400.0
 SOURCE_DIR = ROOT / 'data/dem/moon-detail'
@@ -160,7 +162,7 @@ def sample(ds, source, lat, lon):
     return .5 * ((1 - fr) * ((1 - fc) * z00 + fc * z01) + fr * ((1 - fc) * z10 + fc * z11))
 
 
-def build_patch(lat, lon, progress=lambda _: None):
+def _source_patch(lat, lon, progress=lambda _: None):
     from .moon import elevation, dem_path
     from .moon_native import path_for, prepared
     all_coords = [coordinates(lat, lon, step) for step in STEPS]
@@ -201,6 +203,40 @@ def build_patch(lat, lon, progress=lambda _: None):
                 terrain_model=MODEL_ID, resolution_m=60, sources=sources, coarse_source=dem_path().name,
                 min_m=float(values.min()), max_m=float(values.max()))
     return meta, values.tobytes()
+
+
+def build_patch(lat, lon, progress=lambda _: None):
+    """Deliver the very same height generator used by final candidate verification.
+
+    The vectorized source reader remains the common fallback at source seams and
+    while native caches are incomplete. The checksum identifies this exact patch,
+    including its observer frame, so a stale capture cannot silently be verified.
+    """
+    from .moon import elevation, dem_path
+    from .moon_native import ready, all_maps
+    # JSON in the browser serializes -0 as 0. Canonicalize both here so an
+    # equatorial/meridian capture keeps the same identifier on its round trip.
+    lat, lon = float(lat) or 0., float(lon) or 0.
+    if ready() and not source_boundary(lat, lon):
+        values = mesh_heights(all_maps(), elevation(), lat, lon)
+        sources = set()
+        for step in STEPS[:FINE_LEVELS]:
+            a, b = coordinates(lat, lon, step)
+            bands = np.clip(np.floor(a / 30).astype(int), -3, 2)
+            cols = np.floor((b % 360) / 45).astype(int)
+            ids = np.where(a >= 60, 100, np.where(a <= -60, 101, (bands + 2) * 8 + cols))
+            for i in np.unique(ids, return_index=True)[1]:
+                sources.add(source_at(float(a.flat[i]), float(b.flat[i])).name)
+        meta = dict(lat=lat, lon=lon, n=N, steps=STEPS, radius=RADIUS,
+                    terrain_model=MODEL_ID, resolution_m=60, sources=sorted(sources), coarse_source=dem_path().name,
+                    min_m=float(values.min()), max_m=float(values.max()))
+        data = values.astype('<f4', copy=False).tobytes()
+    else:
+        meta, data = _source_patch(lat, lon, progress)
+    meta['observer_height'] = OBSERVER_HEIGHT
+    frame = {k: meta[k] for k in ('lat', 'lon', 'n', 'steps', 'radius', 'terrain_model', 'observer_height')}
+    meta['surface_id'] = hashlib.sha256(json.dumps(frame, sort_keys=True).encode() + data).hexdigest()
+    return meta, data
 
 
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='moon-detail')

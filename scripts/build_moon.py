@@ -58,7 +58,7 @@ def main():
     if not (out / 'moon_color.jpg').exists():
         with Image.open(ROOT / 'data/raw/lroc_color_poles_4k.tif') as im:
             im.convert('RGB').save(out / 'moon_color.jpg', quality=88)
-    print('Global browser terrain prepared (full source resolution).', flush=True)
+    print('Browser overview assets ready. The 59–60 m surface uses the separate regional elevation cache.', flush=True)
     if args.assets_only:
         return
     if moon.database_ready() and not args.force:
@@ -84,6 +84,7 @@ def main():
             last_message[0] = now
             status('elevation')
     moon_native.prepare_all(progress)
+    print('All 34 native elevation regions are ready. Building approximate horizon curves from these same elevations; no comparison images are generated.', flush=True)
     # Build a separate generation. Existing readers keep valid memory maps, even during a rebuild.
     generation = Path(tempfile.mkdtemp(prefix='grid-', dir=moon.DB_DIR))
     lat = np.arange(90 - args.spacing / 2, -90, -args.spacing)

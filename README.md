@@ -48,6 +48,54 @@ missed by global retrieval. The green reference curve uses those same triangles,
 curvature, near ground and distant rings. Surface model versions are checked so an
 old coarse index cannot silently be used with a new render. Many horizons remain
 ambiguous, and whole-planet retrieval is still experimental.
+
+The current test build reports **photo vs rendered terrain** and **photo vs candidate**
+angular RMSE next to the overlays. A small reference error with a large candidate error
+identifies a retrieval failure rather than an elevation-source mismatch. The coarse
+matcher checks all four heading phases of its 4° rays; final fitting checks quarter-degree
+headings, and SSD candidates are ranked using the actual displayed curves. An additional
+64 regions are retrieved using capped skyline elevations alongside the original 96.
+Exact mesh calculations reuse native elevation maps and batch independent positions;
+global searches use at most four terrain workers. Search responses include per-stage
+`timings`, and the UI shows elapsed time while waiting. These changes do **not** establish
+reliable global location accuracy: the two difficult rendered-photo checks on 2026-11-14
+still missed by approximately 3,122 km and 1,529 km and were flagged unreliable.
+
+Photo analysis no longer waits for the global search lock. Its single-observer reference
+uses serial kernels, and long native terrain kernels release the Python interpreter lock
+so they cannot freeze the API event loop. Reference curves are cached for repeat analysis
+and reused in the final diagnostics. A six-photo local API check on 2026-11-15 completed
+in 0.65 s initially and 0.03 s on repeat while the search lock was deliberately held.
+Caching near-terrain vertices made an 81-position proposal calculation 1.26× faster
+with unchanged horizon values. This is a component measurement; a new full global
+matching benchmark was deliberately not run after the trial was stopped.
+
+The lunar detector now estimates the black-sky noise floor instead of requiring
+10% terrain brightness. It measures dim silhouette edges at subpixel precision
+and leaves abrupt shadow gaps unmeasured. Completely black terrain still has no
+recoverable photographic edge. Simulated captures use lossless PNG to preserve
+faint pixels; lighting remains Sun-only by default.
+
+Browser patches and final candidate verification now share the same height generator,
+including the source-boundary fallback. Reference curves intersect the delivered
+height bytes, and each capture carries a SHA-256 patch identifier covering those bytes,
+the observer height and coordinate frame. Mismatched patches and outdated detection
+servers are rejected explicitly. Coordinates and patch identifiers are only verification
+diagnostics; they never seed or restrict the global search.
+
+`backend/.venv/bin/python eval/check_moon_alignment.py` checks this offline without
+starting servers or rebuilding assets. On 2026-11-15, independent Three.js triangle
+checks at eight locations (including both poles, source seams and the date line)
+differed from the verifier by at most 0.000044°. Eight stored six-photo panoramas
+had extraction RMSE below 0.022°. These are terrain/detection alignment checks,
+not proof of reliable whole-Moon localization. The initial global index remains
+an approximate proposal index; final comparisons use the detailed shared mesh.
+A live browser test at 31.7354° N, 30.06756° E still missed by 2,306.5 km after
+231.17 s despite 0.022° photo/reference RMSE (candidate RMSE 0.530°). An ideal-query
+diagnostic put the nearest indexed position 1,458 m away and about 231,000th by
+the raw global score. Retrieval can therefore discard the correct region before
+the detailed verifier sees it; the alignment repair does not fix this limitation.
+
 Flat, incomplete, poorly fitted or nearly tied skylines are explicitly marked as
 unreliable. These are rejection heuristics, not calibrated confidence. The global
 position grid is still about 3.8 km at the equator; it can miss a correct region

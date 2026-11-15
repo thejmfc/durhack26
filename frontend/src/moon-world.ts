@@ -89,13 +89,14 @@ export class MoonWorld {
   surface(geo: Geo) {
     this.terrain.surfaceOnly = true;
     this.selected = geo; this.mode = 'surface'; this.controls.enabled = false;
-    this.eye.copy(this.field.point(geo.lat, geo.lon)).setLength(this.field.meta.radius + this.terrain.height(geo) + this.field.meta.observer_height);
+    const observerHeight = this.terrain.detail?.data.meta.observer_height ?? this.field.meta.observer_height;
+    this.eye.copy(this.field.point(geo.lat, geo.lon)).setLength(this.field.meta.radius + this.terrain.height(geo) + observerHeight);
     this.camera.position.copy(this.eye); this.terrain.update(this.camera, true);
     // Stand on the actual rendered triangle, avoiding sub-pixel height differences.
     const up = this.field.frame(geo).up;
     const ray = new THREE.Raycaster(this.eye.clone().addScaledVector(up, 20000), up.clone().negate());
     const ground = this.terrain.pick(ray);
-    if (ground) this.eye.copy(ground.point).addScaledVector(up, this.field.meta.observer_height);
+    if (ground) this.eye.copy(ground.point).addScaledVector(up, observerHeight);
     this.setSun(this.sunAz, this.sunEl); this.onMove?.();
   }
   setSun(az: number, el: number) {
