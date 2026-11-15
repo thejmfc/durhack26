@@ -2,6 +2,8 @@ import * as THREE from 'three';
 import { Geo, MoonHeightField, MoonMeta } from './moon-terrain';
 import { MoonWorld } from './moon-world';
 import { loadDetail, SURFACE_MODEL } from './moon-detail';
+import { routeWaypoints } from './moon-route';
+import type { RoutePlan, RouteRequest } from './moon-route';
 import { inferno } from './world';
 import { toJpeg } from './photo';
 import './moon.css';
@@ -58,6 +60,24 @@ async function boot() {
         <label>Sun azimuth <output id="sun-az-o">60°</output><input id="sun-az" type="range" min="0" max="359" value="60" /></label>
         <label>Sun elevation <output id="sun-el-o">25°</output><input id="sun-el" type="range" min="2" max="80" value="25" /></label>
       </details>
+      <details id="route-planner"><summary>Plan a sunlit route</summary>
+        <p class="hint">Choose both points on the terrain or enter coordinates. Planning uses the current Sun angles.</p>
+        <div class="coordinate-fields">
+          <label>Start latitude <input id="route-start-lat" type="number" min="-90" max="90" step="any" placeholder="Latitude" /></label>
+          <label>Start longitude <input id="route-start-lon" type="number" min="-180" max="180" step="any" placeholder="Longitude" /></label>
+        </div>
+        <div class="row"><button id="route-pick-start" type="button">Pick start</button><button id="route-start-current" type="button">Use current</button></div>
+        <div class="coordinate-fields">
+          <label>End latitude <input id="route-end-lat" type="number" min="-90" max="90" step="any" placeholder="Latitude" /></label>
+          <label>End longitude <input id="route-end-lon" type="number" min="-180" max="180" step="any" placeholder="Longitude" /></label>
+        </div>
+        <div class="row"><button id="route-pick-end" type="button">Pick end</button><button id="route-end-current" type="button">Use current</button></div>
+        <p id="route-pick-state" class="hint" role="status" aria-live="polite"></p>
+        <button id="route-plan" class="primary" type="button">Calculate route</button>
+        <button id="route-clear" class="ghost" type="button">Clear route</button>
+        <p id="route-result" class="note" role="status" aria-live="polite">A route will be checked against the measured terrain and Sun direction.</p>
+        <p class="hint">Prefers sunlight but can cross shadows. Estimates use 60 m nearby terrain and coarser terrain farther away, with shadows checked up to 32 km. Long routes use fixed intermediate points. Not mission-certified navigation.</p>
+      </details>
       <p id="terrain-note" class="terrain-note">Surface terrain: measured 59–60 m elevation, loaded when you visit a region. The first visit downloads and caches that region.</p>
       <a class="site-link" href="?site=Site01&view=site">Open the detailed south-pole sites →</a>
       <a class="source-link" href="https://svs.gsfc.nasa.gov/4720/" target="_blank" rel="noreferrer">NASA terrain & imagery</a>
@@ -78,6 +98,7 @@ async function boot() {
       <div class="legend"><i class="c1"></i>extracted skyline <i class="c2"></i>candidate horizon <i style="background:#3ddc97"></i>true horizon</div>
     </section>`;
   const setStatus = (s: string) => { $('status').textContent = s; };
+  const locked = () => { if (busy) setStatus('Please wait for the current terrain load or search…'); return busy; };
   async function get(url: string) {
     const r = await fetch(url);
     if (!r.ok) throw new Error(`Could not load ${url}. Prepare global terrain with scripts/build_moon.py.`);
@@ -91,6 +112,7 @@ async function boot() {
   const field = new MoonHeightField(meta, new Uint16Array(data));
   const world = new MoonWorld($<HTMLCanvasElement>('view'), field, colour);
   let busy = false, ready = false, result: Result | null = null, truth: Geo | null = null;
+  let routePicking: 'start' | 'end' | null = null, plannedRoute = false;
   let shots: HTMLCanvasElement[] = [], shotHeading = 0, shotPitch = 0, shotFov = 66;
   const mapImage = colour.image as HTMLImageElement;
   const sync = () => {
@@ -106,7 +128,111 @@ async function boot() {
       ? 'Drag to look · scroll to zoom · click ground to walk · Escape for regional view.'
       : 'Drag to orbit · scroll to zoom · click the terrain to stand there.';
   };
-  const locked = () => { if (busy) setStatus('Please wait for the current terrain load or search…'); return busy; };
+  const invalidateRoute = () => {
+    if (!plannedRoute) return;
+    world.setRoute([]);
+    plannedRoute = false;
+    $('route-result').className = 'note warn';
+    $('route-result').textContent = 'Route cleared because its endpoints or Sun angles changed. Recalculate it.';
+  };
+  const setRoutePoint = (which: 'start' | 'end', geo: Geo) => {
+    invalidateRoute();
+    $<HTMLInputElement>(`route-${which}-lat`).value = geo.lat.toFixed(5);
+    $<HTMLInputElement>(`route-${which}-lon`).value = geo.lon.toFixed(5);
+    $('route-pick-state').textContent = `${which === 'start' ? 'Start' : 'End'} point set to ${coords(geo)}.`;
+    routePicking = null;
+  };
+  const readRoutePoint = (which: 'start' | 'end'): Geo => {
+    const latText = $<HTMLInputElement>(`route-${which}-lat`).value.trim();
+    const lonText = $<HTMLInputElement>(`route-${which}-lon`).value.trim();
+    const lat = Number(latText), lon = Number(lonText);
+    if (!latText || !lonText || !Number.isFinite(lat) || !Number.isFinite(lon)
+      || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+      throw new Error(`Enter valid ${which} coordinates: latitude −90…90 and longitude −180…180.`);
+    }
+    return { lat, lon };
+  };
+  const calculateRoute = (request: RouteRequest) => new Promise<RoutePlan>((resolve, reject) => {
+    const worker = new Worker(new URL('./moon-route-worker.ts', import.meta.url), { type: 'module' });
+    const channel = new MessageChannel();
+    const finish = () => { worker.terminate(); channel.port1.close(); };
+    channel.port1.onmessage = (event: MessageEvent<{ plan?: RoutePlan; error?: string }>) => {
+      finish();
+      if (event.data.error) reject(new Error(event.data.error));
+      else if (event.data.plan) resolve(event.data.plan);
+      else reject(new Error('The route worker returned no result.'));
+    };
+    channel.port1.onmessageerror = () => { finish(); reject(new Error('Could not read the route worker response.')); };
+    worker.onerror = (event) => {
+      event.preventDefault(); finish();
+      reject(new Error(event.message || 'The route worker failed.'));
+    };
+    try { worker.postMessage({ request, port: channel.port2 }, [channel.port2]); }
+    catch (error) { finish(); reject(error); }
+  });
+  async function createRoute() {
+    if (locked()) return;
+    let start: Geo, end: Geo;
+    try { start = readRoutePoint('start'); end = readRoutePoint('end'); }
+    catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      $('route-result').className = 'note warn'; $('route-result').textContent = message; setStatus(message);
+      return;
+    }
+    busy = true; document.body.classList.add('moon-busy');
+    plannedRoute = false; world.setRoute([]);
+    $('route-result').className = 'note'; $('route-result').textContent = 'Loading measured terrain for this route…';
+    try {
+      const waypoints = routeWaypoints(start, end, field.meta.radius);
+      const sunAz = val('sun-az'), sunEl = val('sun-el');
+      await detailAt(start, false);
+      const detail = world.terrain.detail;
+      if (!detail) throw new Error('Measured terrain did not load for the route start point.');
+      world.setSun(sunAz, sunEl);
+      const plans: RoutePlan[] = [];
+      for (let i = 0; i < waypoints.length - 1; i++) {
+        $('route-result').textContent = `Preparing and checking terrain for leg ${i + 1} of ${waypoints.length - 1}…`;
+        const data = i === 0 ? detail.data : await loadDetail(waypoints[i], setStatus);
+        const request: RouteRequest = {
+          heights: data.heights.slice(), steps: [...data.meta.steps], radius: data.meta.radius,
+          center: { lat: data.meta.lat, lon: data.meta.lon }, start: waypoints[i], end: waypoints[i + 1],
+          sunAz, sunEl, sunReference: start,
+        };
+        plans.push(await calculateRoute(request));
+      }
+      const points = plans.flatMap((plan, i) => i ? plan.points.slice(1) : plan.points);
+      const distance = plans.reduce((sum, plan) => sum + plan.distanceM, 0);
+      const shadowed = plans.reduce((sum, plan) => sum + plan.shadowedDistanceM, 0);
+      const resolution = Math.max(...plans.map((plan) => plan.resolutionM));
+      const maxSlope = Math.max(...plans.map((plan) => plan.maxSlopeDeg));
+      world.setRoute(points, resolution);
+      plannedRoute = true;
+      const focus = points[Math.floor((points.length - 1) / 2)];
+      const target = field.point(focus.lat, focus.lon);
+      target.setLength(field.meta.radius + world.terrain.height(focus));
+      const { up } = field.frame(focus);
+      world.camera.up.copy(up);
+      world.controls.target.copy(target);
+      world.camera.position.copy(target).addScaledVector(up, Math.max(90000, distance * 1.35));
+      world.controls.maxDistance = Math.max(1_000_000, distance * 2);
+      world.controls.update(); world.terrain.update(world.camera, true);
+      sync();
+      const endpointWarnings = [
+        plans[0].startShadowed ? 'Start grid point is shadowed.' : '',
+        plans[plans.length - 1].endShadowed ? 'End grid point is shadowed.' : '',
+      ].filter(Boolean);
+      const report = `${km(distance)} · estimated shadow ${km(shadowed)} · maximum slope ${maxSlope.toFixed(1)}° · up to ${resolution} m terrain grid · ${plans.length} leg${plans.length === 1 ? '' : 's'}. Sun ${sunAz}° azimuth / ${sunEl}° elevation at the start; shadow checks extend 32 km.${endpointWarnings.length ? ` ${endpointWarnings.join(' ')}` : ''}`;
+      $('route-result').className = shadowed > 0 || endpointWarnings.length ? 'note warn' : 'note good';
+      $('route-result').textContent = report;
+      setStatus('');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      world.setRoute([]); plannedRoute = false;
+      $('route-result').className = 'note warn'; $('route-result').textContent = message; setStatus(message);
+    } finally {
+      busy = false; document.body.classList.remove('moon-busy');
+    }
+  }
   const selectedInput = (): Geo => {
     const lat = val('latitude'), lon = val('longitude');
     if (!Number.isFinite(lat) || !Number.isFinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) throw new Error('Enter latitude −90…90 and longitude −180…180.');
@@ -130,6 +256,7 @@ async function boot() {
   }
   async function navigate(geo: Geo, surface: boolean) {
     if (locked()) return;
+    invalidateRoute();
     busy = true;
     try { await detailAt(geo, surface); } catch (e) {
       setStatus((e as Error).message);
@@ -143,7 +270,25 @@ async function boot() {
     world.heading = val('heading'); world.pitch = val('pitch'); world.hfov = val('fov'); sync();
   };
   for (const id of ['sun-az', 'sun-el']) $<HTMLInputElement>(id).oninput = () => {
+    invalidateRoute();
     $(id + '-o').textContent = `${val(id)}°`; world.setSun(val('sun-az'), val('sun-el'));
+  };
+  for (const id of ['route-start-lat', 'route-start-lon', 'route-end-lat', 'route-end-lon']) {
+    $<HTMLInputElement>(id).oninput = invalidateRoute;
+  }
+  $('route-start-current').onclick = () => setRoutePoint('start', world.selected);
+  $('route-end-current').onclick = () => setRoutePoint('end', world.selected);
+  $('route-pick-start').onclick = () => {
+    routePicking = 'start'; $('route-pick-state').textContent = 'Click the lunar surface to choose the start point.';
+  };
+  $('route-pick-end').onclick = () => {
+    routePicking = 'end'; $('route-pick-state').textContent = 'Click the lunar surface to choose the end point.';
+  };
+  $('route-plan').onclick = () => { void createRoute(); };
+  $('route-clear').onclick = () => {
+    world.setRoute([]); plannedRoute = false; routePicking = null;
+    $('route-pick-state').textContent = ''; $('route-result').className = 'note';
+    $('route-result').textContent = 'Route cleared.';
   };
   $('orbit').onclick = () => { if (locked()) return; world.orbit(); sync(); };
   $('region').onclick = () => navigate(world.selected, false);
@@ -162,7 +307,9 @@ async function boot() {
     const click = down && !moved && e.button === 0; down = null;
     if (!click || locked()) return;
     const geo = world.pick(e.clientX, e.clientY);
-    if (geo) void navigate(geo, true);
+    if (!geo) return;
+    if (routePicking) { setRoutePoint(routePicking, geo); return; }
+    void navigate(geo, true);
   });
   addEventListener('keydown', (e) => { if (e.key === 'Escape' && !busy && world.mode === 'surface') { world.region(world.selected); sync(); } });
 

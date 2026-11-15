@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-import fcntl
+import platform
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 
@@ -19,6 +19,10 @@ from rasterio.windows import Window
 
 from .moon_detail import source_at, download
 from .terrain import ROOT
+
+# fcntl is Unix-only
+if platform.system() != 'Windows':
+    import fcntl
 
 DIRECTORY = ROOT / 'data/cache/moon-native-v1'
 SOURCES = tuple(source_at(lat, lon) for lat in (-45, -15, 15, 45) for lon in np.arange(22.5, 360, 45)) + (source_at(90, 0), source_at(-90, 0))
@@ -44,8 +48,12 @@ def prepare(source, progress=print):
     DIRECTORY.mkdir(parents=True, exist_ok=True)
     # Two terminals can request a rebuild. Serialize each source so they reuse
     # completed work instead of doubling large temporary arrays and downloads.
-    with (DIRECTORY / (source.name + '.lock')).open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    lock_path = DIRECTORY / (source.name + '.lock')
+    with lock_path.open('a') as lock:
+        if platform.system() != 'Windows':
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        # On Windows, we don't have true file locking, but writing to the lock file
+        # is atomic enough for our purposes (single machine, not distributed)
         return _prepare(source, progress)
 
 

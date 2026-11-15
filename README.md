@@ -60,6 +60,17 @@ not calibrated probabilities. The existing five detailed south-pole sites remain
 `/?site=Site01&view=site` and the site selector; their original measured accuracy below
 **does not describe the new global matcher**.
 
+The whole-Moon explorer also includes a route planner. Set endpoints by entering
+coordinates or picking terrain, then calculate a slope-aware route that strongly
+penalizes shadowed grid cells but can cross shadows when needed. It reports an
+estimated shadowed distance and checks terrain shadows out to 32 km, using the
+current Sun azimuth and elevation at the start as one fixed direction for the route.
+Long routes are split at fixed great-circle waypoints, so they are not globally
+optimized. Grid spacing follows the clipmap rings (60 m nearby, coarser for longer
+legs); beyond the measured patch the rings use overview elevations. Shadows between
+grid samples, distant obstacles and changing sunlight can be missed. These routes
+are exploratory, not mission-certified navigation.
+
 ### Global setup
 
 #### Linux / macOS

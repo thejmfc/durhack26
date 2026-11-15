@@ -11,6 +11,7 @@ export class MoonWorld {
   sun = new THREE.DirectionalLight(0xffffff, 3);
   fill = new THREE.AmbientLight(0xffffff, 0);
   markers = new THREE.Group();
+  route = new THREE.Group();
   mode: 'orbit' | 'region' | 'surface' = 'orbit';
   selected: Geo = { lat: 0, lon: 0 };
   heading = 0; pitch = 0; hfov = 66;
@@ -37,7 +38,7 @@ export class MoonWorld {
     colour.wrapS = THREE.RepeatWrapping; colour.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy());
     this.material = new THREE.MeshLambertMaterial({ map: colour, shadowSide: THREE.DoubleSide });
     this.terrain = new MoonTerrain(field, this.material);
-    this.scene.add(this.terrain.group, this.sun, this.sun.target, this.fill, this.markers);
+    this.scene.add(this.terrain.group, this.sun, this.sun.target, this.fill, this.markers, this.route);
     this.orbit(); this.setSun(60, 25);
     addEventListener('resize', () => this.resize()); this.resize();
     let down: { x: number; y: number } | null = null;
@@ -133,6 +134,49 @@ export class MoonWorld {
       marker.position.copy(this.field.point(p.geo.lat, p.geo.lon, 100)); marker.renderOrder = 5; this.markers.add(marker);
     }
   }
+  setRoute(points: Geo[], spacingM = 60) {
+    for (const child of [...this.route.children]) {
+      const object = child as THREE.Mesh | THREE.Line;
+      object.geometry.dispose();
+      const materials = Array.isArray(object.material) ? object.material : [object.material];
+      materials.forEach((material) => material.dispose());
+      this.route.remove(object);
+    }
+    if (points.length < 2) return;
+
+    const directions = points.map((geo) => this.field.point(geo.lat, geo.lon).normalize());
+    const dense: THREE.Vector3[] = [];
+    for (let i = 1; i < directions.length; i++) {
+      const a = directions[i - 1], b = directions[i], angle = a.angleTo(b);
+      const count = Math.max(1, Math.ceil(angle * this.field.meta.radius / Math.min(500, spacingM / 2)));
+      for (let j = 0; j < count; j++) dense.push(a.clone().lerp(b, j / count).normalize());
+    }
+    dense.push(directions[directions.length - 1]);
+    const positions: number[] = [];
+    dense.forEach((direction) => {
+      const geo = this.field.geo(direction);
+      direction.setLength(this.field.meta.radius + this.terrain.height(geo) + 20);
+      positions.push(direction.x, direction.y, direction.z);
+    });
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    const line = new THREE.Line(geometry, new THREE.LineBasicMaterial({ color: 0x35d0ff, depthWrite: false }));
+    line.renderOrder = 4;
+    line.frustumCulled = false;
+    this.route.add(line);
+
+    points.slice(0, 1).concat(points.slice(-1)).forEach((geo, index) => {
+      const point = this.field.point(geo.lat, geo.lon);
+      point.setLength(this.field.meta.radius + this.terrain.height(geo) + 120);
+      const marker = new THREE.Mesh(
+        new THREE.SphereGeometry(1, 12, 8),
+        new THREE.MeshBasicMaterial({ color: index ? 0xffd166 : 0x3ddc97 }),
+      );
+      marker.position.copy(point);
+      marker.userData.routeEndpoint = true;
+      this.route.add(marker);
+    });
+  }
   render() {
     if (this.mode === 'surface') this.orient(this.camera, this.selected, this.eye, this.heading, this.pitch, this.hfov, this.canvas.clientWidth / this.canvas.clientHeight);
     else {
@@ -145,6 +189,10 @@ export class MoonWorld {
     this.terrain.update(this.camera);
     this.markers.visible = this.mode !== 'surface';
     this.markers.children.forEach((m) => m.scale.setScalar(Math.max(20, this.camera.position.distanceTo(m.position) * 0.006)));
+    this.route.visible = this.mode !== 'surface';
+    this.route.children.filter((m) => m.userData.routeEndpoint).forEach((m) => {
+      m.scale.setScalar(Math.max(120, this.camera.position.distanceTo(m.position) * 0.003));
+    });
     this.renderer.setRenderTarget(null); this.renderer.render(this.scene, this.camera);
   }
   capture(heading: number, pitch: number, hfov: number, width = 800, height = 600) {
@@ -152,11 +200,12 @@ export class MoonWorld {
     this.orient(cam, this.selected, this.eye, heading, pitch, hfov, width / height);
     const target = new THREE.WebGLRenderTarget(width, height, { samples: 4 });
     target.texture.colorSpace = THREE.SRGBColorSpace;
-    const visible = this.markers.visible; this.markers.visible = false;
+    const visible = this.markers.visible, routeVisible = this.route.visible;
+    this.markers.visible = false; this.route.visible = false;
     const buf = new Uint8Array(width * height * 4);
     try {
       this.renderer.setRenderTarget(target); this.renderer.render(this.scene, cam); this.renderer.readRenderTargetPixels(target, 0, 0, width, height, buf);
-    } finally { this.renderer.setRenderTarget(null); target.dispose(); this.markers.visible = visible; }
+    } finally { this.renderer.setRenderTarget(null); target.dispose(); this.markers.visible = visible; this.route.visible = routeVisible; }
     const cv = document.createElement('canvas'); cv.width = width; cv.height = height;
     const ctx = cv.getContext('2d')!, im = ctx.createImageData(width, height);
     for (let r = 0; r < height; r++) im.data.set(buf.subarray((height - r - 1) * width * 4, (height - r) * width * 4), r * width * 4);

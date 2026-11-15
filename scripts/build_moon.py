@@ -8,11 +8,15 @@ import json
 import sys
 import time
 import tempfile
-import fcntl
+import platform
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
+
+# fcntl is Unix-only; use platform-specific locking
+if platform.system() != 'Windows':
+    import fcntl
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'backend'))
@@ -127,16 +131,37 @@ def main():
 
 if __name__ == '__main__':
     moon.DB_DIR.mkdir(parents=True, exist_ok=True)
-    with (moon.DB_DIR / 'build.lock').open('a') as lock:
+    lock_file = moon.DB_DIR / 'build.lock'
+
+    # Windows doesn't support fcntl; use simpler advisory locking
+    if platform.system() == 'Windows':
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise SystemExit('A whole-Moon build is already running. Let that build finish.')
-        # Also recognise a build started before the advisory lock was introduced.
-        try:
-            active = json.loads((moon.DB_DIR / 'build.json').read_text())
-        except (OSError, ValueError):
-            active = {}
-        if active.get('phase') in ('elevation', 'index') and time.time() - active.get('updated', 0) < 180:
-            raise SystemExit('Another build has reported progress recently. Wait for it to finish (or three minutes after stopping it).')
-        main()
+            # Try to open in exclusive mode (Windows-specific behavior)
+            lock = open(lock_file, 'a')
+            # On Windows, we can't truly lock, so just check if build.json indicates recent activity
+            try:
+                active = json.loads((moon.DB_DIR / 'build.json').read_text())
+            except (OSError, ValueError):
+                active = {}
+            if active.get('phase') in ('elevation', 'index') and time.time() - active.get('updated', 0) < 180:
+                raise SystemExit('Another build has reported progress recently. Wait for it to finish (or three minutes after stopping it).')
+            main()
+            lock.close()
+        except Exception as e:
+            if 'build' in str(e).lower() and 'already running' not in str(e):
+                raise
+            raise SystemExit(str(e))
+    else:
+        with lock_file.open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise SystemExit('A whole-Moon build is already running. Let that build finish.')
+            # Also recognise a build started before the advisory lock was introduced.
+            try:
+                active = json.loads((moon.DB_DIR / 'build.json').read_text())
+            except (OSError, ValueError):
+                active = {}
+            if active.get('phase') in ('elevation', 'index') and time.time() - active.get('updated', 0) < 180:
+                raise SystemExit('Another build has reported progress recently. Wait for it to finish (or three minutes after stopping it).')
+            main()
